@@ -11521,6 +11521,42 @@ class SnakeGame:
             self.powerup_position = None
             self.powerup_type = None
             
+    def _shield_redirect(self, head_x, head_y):
+        """Try to save the snake using its shield by redirecting it to a
+        safe adjacent direction, instead of ending the game.
+
+        Respects self.settings.wall_collision: previously this always
+        wrapped the candidate position modulo the board size, so a shield
+        save could teleport the snake straight through a wall even in a
+        walled game (wall_collision=True) — a save that should only ever
+        be possible in wrap-around mode. Now a direction that would cross
+        a wall is treated as unsafe, exactly like the main movement check
+        above it.
+
+        Returns the new head position to use if a safe direction was
+        found, or None if the snake is boxed in on every side (caller
+        should end the game as normal).
+        """
+        safe_directions = []
+        for test_dir in [(0, -1), (1, 0), (0, 1), (-1, 0)]:  # up, right, down, left
+            raw_x, raw_y = head_x + test_dir[0], head_y + test_dir[1]
+            if self.settings.wall_collision and not self.invincible:
+                if raw_x < 0 or raw_x >= self.board_width or raw_y < 0 or raw_y >= self.board_height:
+                    continue  # would cross a wall — not a safe direction here
+                test_pos = (raw_x, raw_y)
+            else:
+                test_pos = (raw_x % self.board_width, raw_y % self.board_height)
+            if test_pos not in self.snake and test_pos not in self.obstacles:
+                safe_directions.append((test_dir, test_pos))
+
+        if not safe_directions:
+            return None
+
+        test_dir, new_head = self.rng.choice(safe_directions)
+        self.direction = test_dir
+        self.next_direction = test_dir
+        return new_head
+
     def move_snake(self):
         """Move the snake according to the current direction"""
         if self.game_over or self.victory or self.paused:
@@ -11559,21 +11595,9 @@ class SnakeGame:
             # If shield is active, consume the shield instead of game over
             if self.shield_active:
                 self.shield_active = False
-                # Find a safe direction to redirect the snake
-                safe_directions = []
-                for test_dir in [(0, -1), (1, 0), (0, 1), (-1, 0)]:  # up, right, down, left
-                    test_pos = ((head_x + test_dir[0]) % self.board_width, 
-                               (head_y + test_dir[1]) % self.board_height)
-                    if test_pos not in self.snake and test_pos not in self.obstacles:
-                        safe_directions.append(test_dir)
-                
-                if safe_directions:
-                    # Redirect snake to a safe direction
-                    self.direction = self.rng.choice(safe_directions)
-                    self.next_direction = self.direction
-                    dir_x, dir_y = self.direction
-                    new_head = ((head_x + dir_x) % self.board_width, 
-                               (head_y + dir_y) % self.board_height)
+                redirected = self._shield_redirect(head_x, head_y)
+                if redirected is not None:
+                    new_head = redirected
                 else:
                     # No safe direction available
                     self.game_over = True
@@ -11583,27 +11607,15 @@ class SnakeGame:
                 self.game_over = True
                 self.save_score()
                 return
-            
+
         # Check for collision with obstacles (only if not invincible)
         if new_head in self.obstacles and not self.invincible:
             # If shield is active, consume the shield instead of game over
             if self.shield_active:
                 self.shield_active = False
-                # Find a safe direction to redirect the snake
-                safe_directions = []
-                for test_dir in [(0, -1), (1, 0), (0, 1), (-1, 0)]:  # up, right, down, left
-                    test_pos = ((head_x + test_dir[0]) % self.board_width, 
-                               (head_y + test_dir[1]) % self.board_height)
-                    if test_pos not in self.snake and test_pos not in self.obstacles:
-                        safe_directions.append(test_dir)
-                
-                if safe_directions:
-                    # Redirect snake to a safe direction
-                    self.direction = self.rng.choice(safe_directions)
-                    self.next_direction = self.direction
-                    dir_x, dir_y = self.direction
-                    new_head = ((head_x + dir_x) % self.board_width, 
-                               (head_y + dir_y) % self.board_height)
+                redirected = self._shield_redirect(head_x, head_y)
+                if redirected is not None:
+                    new_head = redirected
                 else:
                     # No safe direction available
                     self.game_over = True
