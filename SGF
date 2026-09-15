@@ -14,23 +14,20 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
-import os
-import sys
 import pygame
 import json
 import random
 import time
 import math
 import copy
-import datetime
-from datetime import datetime
+from datetime import datetime, timedelta
 import struct
+import tempfile
 import threading
 import queue as _queue_mod
 import socket as _socket_mod
 import subprocess
 import webbrowser
-from datetime import timedelta
 
 # Initialize pygame
 pygame.init()
@@ -9250,6 +9247,32 @@ def _load_data():
 
 _data_save_lock = threading.Lock()
 
+def _atomic_write_json(path, data):
+    """Write JSON to `path` without ever leaving a half-written file behind.
+
+    Writes to a temp file in the same directory first, flushes it to disk,
+    then uses os.replace() to atomically swap it into place. os.replace()
+    on the same filesystem is atomic at the OS level: a process that
+    crashes, loses power, or gets force-killed mid-write will find either
+    the old complete file or the new complete file next time it starts,
+    never a truncated/corrupt one. Without this, a crash during the plain
+    open(...)+write could zero out or truncate snake_game_data.json,
+    silently wiping every saved score, achievement, and setting at once."""
+    directory = os.path.dirname(os.path.abspath(path)) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix='.snake_data_', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w') as _f:
+            json.dump(data, _f, indent=2)
+            _f.flush()
+            os.fsync(_f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 def _save_data(data):
     """Write the unified game data JSON (synchronous — use this for saves
     that must complete before continuing, e.g. right before the app exits).
@@ -9257,8 +9280,7 @@ def _save_data(data):
     clobbered by a slower background save landing right after it."""
     with _data_save_lock:
         try:
-            with open(_DATA_FILE, 'w') as _f:
-                json.dump(data, _f, indent=2)
+            _atomic_write_json(_DATA_FILE, data)
         except Exception as _e:
             print(f"Error saving data: {_e}")
 
@@ -9285,8 +9307,7 @@ def _save_data_async(mutate_fn):
             try:
                 data = _load_data()
                 data = mutate_fn(data)
-                with open(_DATA_FILE, 'w') as _f:
-                    json.dump(data, _f, indent=2)
+                _atomic_write_json(_DATA_FILE, data)
             except Exception as _e:
                 print(f"Error saving data (async): {_e}")
     threading.Thread(target=_write, daemon=True).start()
