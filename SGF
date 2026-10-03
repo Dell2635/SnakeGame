@@ -14387,6 +14387,8 @@ class SnakeGame:
         self._sim_time_ms = 0.0
         self._update_accumulator_ms = 0.0
         self.reset_game()
+        if 'DEV_TOOLS' in globals():
+            DEV_TOOLS.register_game(self)
         
     def _enc_touch(self, entry_id, encountered=0, used=0):
         """Accumulate an encyclopedia encounter/use count for this match;
@@ -14687,6 +14689,14 @@ class SnakeGame:
                 else:
                     self.current_fruit_value = 1
 
+                dev_forced = None
+                try:
+                    dev_forced = DEV_TOOLS.forced_fruit() if DEV_TOOLS.active and DEV_TOOLS.cheats.get('force_next_item') else None
+                except Exception:
+                    dev_forced = None
+                if dev_forced in _DEV_FRUITS:
+                    self.current_fruit_type = dev_forced
+                    self.current_fruit_value = 2 if dev_forced == 'golden' else (3 if dev_forced in ('yellow', 'maroon') else 1)
                 self._enc_touch(_FRUIT_TYPE_TO_ENC_ID.get(self.current_fruit_type), encountered=1)
             else:
                 # Default to regular fruit if different types are disabled
@@ -14803,8 +14813,15 @@ class SnakeGame:
             self.powerup_type = None
             return
             
-        # Select a random power-up type
-        self.powerup_type = self.rng.choice(available_powerups)
+        # Select a random power-up type (or a one-shot DEV forced value).
+        forced_powerup = None
+        try:
+            if DEV_TOOLS.active and DEV_TOOLS.forced_powerup in available_powerups:
+                forced_powerup = DEV_TOOLS.forced_powerup
+                DEV_TOOLS.forced_powerup = None
+        except Exception:
+            forced_powerup = None
+        self.powerup_type = forced_powerup or self.rng.choice(available_powerups)
         self._enc_touch(_POWERUP_TYPE_TO_ENC_ID.get(self.powerup_type), encountered=1)
         
         # Generate power-up position (not on snake, obstacles, or fruit)
@@ -14843,7 +14860,7 @@ class SnakeGame:
         safe_directions = []
         for test_dir in [(0, -1), (1, 0), (0, 1), (-1, 0)]:  # up, right, down, left
             raw_x, raw_y = head_x + test_dir[0], head_y + test_dir[1]
-            if self.settings.wall_collision and not self.invincible:
+            if self.settings.wall_collision and not self.invincible and not getattr(self, '_dev_no_wall_collision', False):
                 if raw_x < 0 or raw_x >= self.board_width or raw_y < 0 or raw_y >= self.board_height:
                     continue  # would cross a wall — not a safe direction here
                 test_pos = (raw_x, raw_y)
@@ -15158,14 +15175,18 @@ class SnakeGame:
     def handle_input(self, event):
         """Handle player input"""
         if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                DEV_TOOLS.open_panel(self.screen, self)
+                return True
+            event_key = DEV_TOOLS.reverse_direction_key(event.key)
             # Movement controls: WASD and Arrow keys
-            if event.key in (pygame.K_w, pygame.K_UP) and self.direction != (0, 1):
+            if event_key in (pygame.K_w, pygame.K_UP) and self.direction != (0, 1):
                 self.next_direction = (0, -1)
-            elif event.key in (pygame.K_s, pygame.K_DOWN) and self.direction != (0, -1):
+            elif event_key in (pygame.K_s, pygame.K_DOWN) and self.direction != (0, -1):
                 self.next_direction = (0, 1)
-            elif event.key in (pygame.K_a, pygame.K_LEFT) and self.direction != (1, 0):
+            elif event_key in (pygame.K_a, pygame.K_LEFT) and self.direction != (1, 0):
                 self.next_direction = (-1, 0)
-            elif event.key in (pygame.K_d, pygame.K_RIGHT) and self.direction != (-1, 0):
+            elif event_key in (pygame.K_d, pygame.K_RIGHT) and self.direction != (-1, 0):
                 self.next_direction = (1, 0)
             # Pause game
             elif event.key == pygame.K_SPACE:
@@ -15180,22 +15201,6 @@ class SnakeGame:
                 return False
         return True
                 
-    def _recompute_speed_multiplier(self):
-        """Combine every currently-active speed-affecting power-up instead of
-        the last activate/deactivate call blindly overwriting a single value.
-        speed_boost and slow_motion multiply together (0.5x / 2.0x each), so
-        one of each cancels out to normal speed, and when one of them expires
-        the other's effect on its own becomes active again — instead of the
-        old behavior where deactivating *either* one reset speed to 1.0
-        regardless of what else was still active."""
-        mult = 1.0
-        for p in self.active_powerups:
-            if p['type'] == 'speed_boost':
-                mult *= 0.5
-            elif p['type'] == 'slow_motion':
-                mult *= 2.0
-        self.speed_multiplier = mult
-
     def activate_powerup(self, powerup_type):
         """Activate a power-up effect"""
         current_time = self._sim_time_ms
@@ -15208,8 +15213,10 @@ class SnakeGame:
         })
         
         # Apply power-up effect
-        if powerup_type in ('speed_boost', 'slow_motion'):
-            self._recompute_speed_multiplier()
+        if powerup_type == 'speed_boost':
+            self.speed_multiplier = 0.5  # Half the update time (twice as fast)
+        elif powerup_type == 'slow_motion':
+            self.speed_multiplier = 2.0  # Double the update time (half speed)
         elif powerup_type == 'size_reduction':
             # Remove one segment from the snake's tail if possible
             if len(self.snake) > 1:
@@ -15227,11 +15234,9 @@ class SnakeGame:
             self.shield_active = True
     
     def deactivate_powerup(self, powerup_type):
-        """Deactivate a power-up effect. Called after the expired entry has
-        already been removed from active_powerups, so recomputing from what's
-        left correctly restores whichever speed effect (if any) is still active."""
-        if powerup_type in ('speed_boost', 'slow_motion'):
-            self._recompute_speed_multiplier()
+        """Deactivate a power-up effect"""
+        if powerup_type == 'speed_boost' or powerup_type == 'slow_motion':
+            self.speed_multiplier = 1.0  # Reset to normal speed
         elif powerup_type == 'invincibility':
             self.invincible = False
         elif powerup_type == 'double_points':
@@ -15668,7 +15673,15 @@ class SnakeGame:
             if hasattr(self, 'current_fruit_type') and self.settings.fruit_types_enabled:
                 # Use textured fruits if cells are large enough
                 if self.cell_size >= 10:
-                    draw_fruit(self.screen, fruit_rect, self.current_fruit_type)
+                    dev_fruit_type = getattr(DEV_TOOLS, '_next_preview', None) if DEV_TOOLS.cheats.get('rainbow_items') else self.current_fruit_type
+                    if DEV_TOOLS.cheats.get('everything_apple'):
+                        dev_fruit_type = 'regular'
+                    dev_rect = fruit_rect
+                    if DEV_TOOLS.cheats.get('giant_fruits'):
+                        dev_rect = fruit_rect.inflate(max(2, self.cell_size // 2), max(2, self.cell_size // 2))
+                    elif DEV_TOOLS.cheats.get('tiny_fruits'):
+                        dev_rect = fruit_rect.inflate(-max(2, self.cell_size // 3), -max(2, self.cell_size // 3))
+                    draw_fruit(self.screen, dev_rect, dev_fruit_type)
                 else:
                     # For very small cells, use simple colored circles
                     center_x = fruit_rect.centerx
@@ -15799,6 +15812,8 @@ class SnakeGame:
         snake_color = self.settings.snake_color
         # Head color: brighter variant of the chosen snake color
         head_color = tuple(min(255, c + 60) for c in snake_color)
+        dev_scale = 1.45 if DEV_TOOLS.cheats.get('giant_snake') else (0.65 if DEV_TOOLS.cheats.get('tiny_snake') else 1.0)
+        dev_invisible = DEV_TOOLS.cheats.get('invisible_snake')
         
         # Apply visual effects for active powerups
         # Ghost mode: Semi-transparent snake
@@ -15820,15 +15835,19 @@ class SnakeGame:
                 self.cell_size,
                 self.cell_size
             )
+            if dev_scale != 1.0:
+                scaled = max(2, int(self.cell_size * dev_scale))
+                snake_rect = pygame.Rect(snake_rect.centerx - scaled // 2, snake_rect.centery - scaled // 2, scaled, scaled)
             
-            if shield_active:
+            if shield_active and not dev_invisible:
                 # Draw gold shield outline
                 shield_rect = snake_rect.inflate(4, 4)
                 pygame.draw.rect(self.screen, COLORS['powerup_shield'], shield_rect, 2)
             
             if i == 0:  # Head - make it distinctive with eyes and a different shape
                 # Draw head with slightly larger size to make it stand out
-                pygame.draw.rect(self.screen, head_color, snake_rect)
+                if not dev_invisible:
+                    pygame.draw.rect(self.screen, head_color, snake_rect)
                 
                 # Draw eyes on the head based on direction
                 eye_size = max(4, self.cell_size // 5)
@@ -15851,18 +15870,21 @@ class SnakeGame:
                     right_eye = (snake_rect.right - eye_offset - eye_size, snake_rect.bottom - eye_offset*2)
                 
                 # Draw eyes
-                pygame.draw.rect(self.screen, eye_color, pygame.Rect(left_eye[0], left_eye[1], eye_size, eye_size))
-                pygame.draw.rect(self.screen, eye_color, pygame.Rect(right_eye[0], right_eye[1], eye_size, eye_size))
+                
+                if not dev_invisible:
+                    pygame.draw.rect(self.screen, eye_color, pygame.Rect(left_eye[0], left_eye[1], eye_size, eye_size))
+                    pygame.draw.rect(self.screen, eye_color, pygame.Rect(right_eye[0], right_eye[1], eye_size, eye_size))
                 
                 # Draw pupils (smaller rectangle inside eyes)
                 pupil_size = max(2, eye_size // 2)
                 pupil_offset = (eye_size - pupil_size) // 2
-                pygame.draw.rect(self.screen, pupil_color, 
-                                pygame.Rect(left_eye[0] + pupil_offset, left_eye[1] + pupil_offset, 
-                                           pupil_size, pupil_size))
-                pygame.draw.rect(self.screen, pupil_color, 
-                                pygame.Rect(right_eye[0] + pupil_offset, right_eye[1] + pupil_offset, 
-                                           pupil_size, pupil_size))
+                if not dev_invisible:
+                    pygame.draw.rect(self.screen, pupil_color,
+                                    pygame.Rect(left_eye[0] + pupil_offset, left_eye[1] + pupil_offset,
+                                               pupil_size, pupil_size))
+                    pygame.draw.rect(self.screen, pupil_color,
+                                    pygame.Rect(right_eye[0] + pupil_offset, right_eye[1] + pupil_offset,
+                                               pupil_size, pupil_size))
                 
             elif i == len(self.snake) - 1:  # Tail - make it slightly smaller
                 # Make the tail slightly tapered
@@ -15873,9 +15895,16 @@ class SnakeGame:
                     snake_rect.width - (tail_margin * 2),
                     snake_rect.height - (tail_margin * 2)
                 )
-                pygame.draw.rect(self.screen, snake_color, tail_rect)
+                if not dev_invisible:
+                    pygame.draw.rect(self.screen, snake_color, tail_rect)
             else:  # Body
-                pygame.draw.rect(self.screen, snake_color, snake_rect)
+                if not dev_invisible:
+                    if DEV_TOOLS.cheats.get('rainbow_snake') or DEV_TOOLS.cheats.get('disco_snake'):
+                        phase = time.time() * (3.0 if DEV_TOOLS.cheats.get('disco_snake') else 1.2) + i * 0.28
+                        colour = (int((math.sin(phase) + 1) * 127), int((math.sin(phase + 2.1) + 1) * 127), int((math.sin(phase + 4.2) + 1) * 127))
+                    else:
+                        colour = snake_color
+                    pygame.draw.rect(self.screen, colour, snake_rect)
         
         # Draw score
         font = get_font(self.settings.language, 'bold', 24)
@@ -16516,6 +16545,9 @@ class SnakeGame:
             # Tick first so the returned delta is the elapsed real time since the
             # previous loop iteration. Clamp large stalls to avoid a catch-up spiral.
             frame_dt = min(float(clock.tick(60)), 250.0)
+            raw_frame_dt = frame_dt
+            frame_dt = DEV_TOOLS.scale_dt(frame_dt)
+            input_start = time.perf_counter()
             update_ms = 0.0
             render_ms = 0.0
             replay_ms = 0.0
@@ -16529,6 +16561,8 @@ class SnakeGame:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_F11:
                         self.screen = _toggle_fullscreen(self.screen)
+                    elif event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                        DEV_TOOLS.open_panel(self.screen, self)
                     elif self.replay_mode:
                         self.replay_control(event)
                     else:
@@ -16576,6 +16610,7 @@ class SnakeGame:
                     self.board_offset_x = (self.screen.get_width() - (self.board_width * self.cell_size)) // 2
                     self.board_offset_y = (self.screen.get_height() - (self.board_height * self.cell_size)) // 2
 
+            input_ms = (time.perf_counter() - input_start) * 1000.0
             if self._replay_exit_requested:
                 running = False
                 self.replay_mode = False
@@ -16617,6 +16652,7 @@ class SnakeGame:
                         effective_update_rate = max(1.0, effective_update_rate)
                         if self._update_accumulator_ms < effective_update_rate:
                             break
+                        DEV_TOOLS.apply_frame_cheats(self)
                         self.move_snake()
                         self._update_accumulator_ms -= effective_update_rate
                         self.last_update_time = self._sim_time_ms - self._update_accumulator_ms
@@ -16660,8 +16696,10 @@ class SnakeGame:
                 self.draw_replay_controls()
 
             _legacy_nav_draw(locals().get('self'))
+            DEV_TOOLS.draw_game_overlay(self.screen, self)
             pygame.display.flip()
             render_ms = (time.perf_counter() - render_start) * 1000.0
+            _dev_game_frame_hook(self, raw_frame_dt, update_ms=update_ms, render_ms=render_ms, input_ms=input_ms, replay_ms=replay_ms)
 
             object_counts = {
                 'snake_segments': len(getattr(self, 'snake', [])),
@@ -17047,78 +17085,6 @@ class HighScoresScreen:
 
         return interactive_rects
             
-    _BASE_COL_WIDTHS = [55, 160, 80, 170, 100, 80, 70, 36]   # comfortable (English-sized)
-    _MIN_COL_WIDTHS = [50, 140, 75, 160, 95, 75, 70, 36]     # tightest that still fits the row data
-
-    @staticmethod
-    def _split_two_lines(font, text):
-        """Best 2-line split of `text` at a space (minimises the wider line).
-        Returns (line1, line2, widest) or None when there is no space."""
-        words = text.split(' ')
-        best = None
-        for k in range(1, len(words)):
-            a, b = ' '.join(words[:k]), ' '.join(words[k:])
-            w = max(font.size(a)[0], font.size(b)[0])
-            if best is None or w < best[2]:
-                best = (a, b, w)
-        return best
-
-    def _table_columns(self, headers):
-        """(header_font_size, col_widths, two_line) for the current language
-        and window width. Columns grow to fit their *translated* header
-        (Greek, German, Spanish... are far wider than English). Preference:
-        full size -> two-line headers -> smaller font (never below 12px); if
-        even that is too wide the columns are squeezed and render_fit() is the
-        last resort. Cached per (language, window width, headers)."""
-        sig = (self.settings.language, self.screen.get_width(), tuple(headers))
-        cached = getattr(self, '_table_cols_cache', None)
-        if cached and cached[0] == sig:
-            return cached[1], list(cached[2]), cached[3]
-        avail = max(300, self.screen.get_width() - 44)  # side margins + scrollbar
-        candidates = []
-        for size in range(22, 15, -1):
-            candidates.append((size, False))
-            candidates.append((size, True))
-        candidates += [(size, True) for size in range(15, 11, -1)]
-        chosen = None
-        for size, two in candidates:
-            font = get_font(self.settings.language, 'bold', size)
-            need = []
-            for t in headers:
-                if not t:
-                    need.append(0)
-                    continue
-                w = font.size(t)[0]
-                if two:
-                    sp = self._split_two_lines(font, t)
-                    if sp is not None:
-                        w = min(w, sp[2])
-                need.append(w + 14)
-            for floor in (self._BASE_COL_WIDTHS, self._MIN_COL_WIDTHS):
-                widths = [max(floor[i], need[i]) for i in range(len(floor))]
-                if sum(widths) <= avail:
-                    chosen = (size, widths, two)
-                    break
-            if chosen:
-                break
-        if chosen is None:
-            f = avail / float(sum(widths))
-            chosen = (12, [max(30, int(w * f)) for w in widths], True)
-        size, widths, two = chosen
-        self._table_cols_cache = (sig, size, list(widths), two)
-        return size, widths, two
-
-    def _header_surfaces(self, font, text, col_w, two_line):
-        """1 or 2 rendered lines for a column header that fit `col_w`."""
-        one = font.render(text, True, COLORS['white'])
-        if one.get_width() <= col_w or not two_line:
-            return [render_fit(font, text, COLORS['white'], col_w, padding=0)]
-        sp = self._split_two_lines(font, text)
-        if sp is None:
-            return [render_fit(font, text, COLORS['white'], col_w, padding=0)]
-        return [render_fit(font, sp[0], COLORS['white'], col_w, padding=0),
-                render_fit(font, sp[1], COLORS['white'], col_w, padding=0)]
-
     def draw_screen(self):
         """Draw the high scores screen"""
         # Fill background
@@ -17155,6 +17121,7 @@ class HighScoresScreen:
             self.detail_buttons = []
 
             # Draw table headers
+            header_font = get_font(self.settings.language, 'bold', 22)
             headers = [
                 get_text(self.settings.language, 'rank'),
                 get_text(self.settings.language, 'player_name'),
@@ -17166,23 +17133,15 @@ class HighScoresScreen:
                 "",   # delete button column
             ]
 
-            # Column widths follow the *translated* header text (Greek, German,
-            # Vietnamese... are far wider than English), instead of a fixed
-            # English-sized table that made neighbouring headers overlap.
-            hdr_size, col_widths, two_line = self._table_columns(headers)
-            header_font = get_font(self.settings.language, 'bold', hdr_size)
+            col_widths = [55, 160, 80, 170, 100, 80, 70, 36]
             total_width = sum(col_widths)
             start_x = (self.screen.get_width() - total_width) // 2
 
-            line_h = header_font.get_linesize()
-            hdr_lines = [self._header_surfaces(header_font, t, col_widths[i] - 4, two_line) if t else []
-                         for i, t in enumerate(headers)]
-            hdr_y = 148 - max([len(l) for l in hdr_lines] + [1]) * line_h
             x = start_x
-            for i, lines in enumerate(hdr_lines):
-                for k, surf in enumerate(lines):
-                    self.screen.blit(surf, (x + col_widths[i] // 2 - surf.get_width() // 2,
-                                            hdr_y + k * line_h))
+            for i, col_header in enumerate(headers):
+                if col_header:
+                    hs = header_font.render(col_header, True, COLORS['white'])
+                    self.screen.blit(hs, (x + col_widths[i] // 2 - hs.get_width() // 2, 120))
                 x += col_widths[i]
 
             pygame.draw.line(self.screen, COLORS['white'],
@@ -20267,6 +20226,25 @@ class LegacyAutoNavigator:
 def _legacy_nav_event(owner, event, scope):
     if owner is None or not _nav_owner_enabled(owner):
         return False
+    if 'DEV_TOOLS' in globals() and DEV_TOOLS.unlocked:
+        # Single hook point so every legacy screen that already calls
+        # _legacy_nav_event (High Scores, Settings, Encyclopedia, Map
+        # Editor, Tutorial, lobby/config/gameplay screens, ...) gets these
+        # for free, instead of wiring them into each screen by hand — per
+        # spec: unlocked DEV Mode should be reachable from almost anywhere
+        # in the game, not just gameplay, and the overlay must have a quick
+        # way to get out of the way without obstructing gameplay.
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F8:
+            DEV_TOOLS.open_panel(getattr(owner, 'screen', None), game=None)
+            return True
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F9:
+            DEV_TOOLS.toggle_overlay_hidden()
+            return True
+        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                and DEV_TOOLS._overlay_toggle_rect is not None
+                and DEV_TOOLS._overlay_toggle_rect.collidepoint(event.pos)):
+            DEV_TOOLS.toggle_overlay_hidden()
+            return True
     nav = getattr(owner, '_sgf_legacy_nav', None)
     if nav is None:
         nav = LegacyAutoNavigator(owner)
@@ -22005,21 +21983,6 @@ def _validate_net_map(map_data):
             return False
         if not (0 <= x < bw and 0 <= y < bh):
             return False
-    portals = map_data.get('portals', [])
-    if not isinstance(portals, list) or len(portals) > min((bw * bh) // 2, 64):
-        return False
-    for portal in portals:
-        if not isinstance(portal, (list, tuple)) or len(portal) != 5:
-            return False
-        try:
-            x1, y1, x2, y2 = map(int, portal[:4])
-            palette = int(portal[4])
-        except (TypeError, ValueError):
-            return False
-        if not (0 <= x1 < bw and 0 <= y1 < bh and 0 <= x2 < bw and 0 <= y2 < bh):
-            return False
-        if (x1, y1) == (x2, y2) or palette < 0 or palette > 255:
-            return False
     return True
 
 
@@ -22197,6 +22160,8 @@ class MultiplayerGame:
         self.mp_history       = []
         self._init_layout()
         self.reset()
+        if 'DEV_TOOLS' in globals():
+            DEV_TOOLS.register_game(self)
 
     # ── layout ──────────────────────────────────────────────────────────
 
@@ -22299,7 +22264,7 @@ class MultiplayerGame:
     def _new_head(self, snake, direction):
         hx, hy = snake[0]
         dx, dy = direction
-        if self.settings.wall_collision:
+        if self.settings.wall_collision and not getattr(self, '_dev_no_wall_collision', False):
             nx, ny = hx + dx, hy + dy
             if not (0 <= nx < self.board_width and 0 <= ny < self.board_height):
                 return None
@@ -22334,6 +22299,8 @@ class MultiplayerGame:
 
         p1_die = h1 is None
         p2_die = h2 is None
+        if getattr(self, '_dev_no_death', False):
+            p1_die = p2_die = False
 
         # Head-on collision (both arrive at same cell simultaneously)
         if h1 and h2 and h1 == h2:
@@ -22529,6 +22496,10 @@ class MultiplayerGame:
                 if event.type == pygame.QUIT:
                     self._replay_exit = True
                 elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                        target_game = getattr(self, 'mp', None) or getattr(self, '_client_recorder', None) or self
+                        DEV_TOOLS.open_panel(self.screen, target_game)
+                        continue
                     if event.key == pygame.K_ESCAPE:
                         self._replay_exit = True
                     elif event.key == pygame.K_SPACE:
@@ -22726,6 +22697,8 @@ class MultiplayerGame:
         saved   = False
 
         while running:
+            frame_start = time.perf_counter()
+            input_start = frame_start
             for event in pygame.event.get():
                 if _legacy_nav_event(locals().get('self'), event, locals()):
                     continue
@@ -22756,7 +22729,8 @@ class MultiplayerGame:
 
             now = time.time() * 1000
             if not self.paused and not self.game_over:
-                if now - self.last_tick >= self.settings.update_rate_ms:
+                if now - self.last_tick >= DEV_TOOLS.scaled_update_interval(self.settings.update_rate_ms):
+                    DEV_TOOLS.apply_frame_cheats(self)
                     self.tick()
                     self.last_tick = now
 
@@ -22764,16 +22738,16 @@ class MultiplayerGame:
                 self.save_match(source='local')
                 saved = True
 
+            render_start = time.perf_counter()
             self.draw()
             _legacy_nav_draw(locals().get('self'))
+            DEV_TOOLS.draw_dev_indicator(self.screen, replay=bool(getattr(self, 'replay_mode', False)))
+            render_ms = (time.perf_counter() - render_start) * 1000.0
+            frame_ms = clock.tick(60)
+            input_ms = (time.perf_counter() - input_start) * 1000.0
+            _dev_game_frame_hook(self, frame_ms, render_ms=render_ms, input_ms=input_ms)
             pygame.display.flip()
-            clock.tick(60)
 
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IA7-12: Local multiplayer for 1-4 players
-# ─────────────────────────────────────────────────────────────────────────────
 
 _MP_CONTROL_PRESETS = (
     {'up': 'w', 'down': 's', 'left': 'a', 'right': 'd'},
@@ -23208,6 +23182,7 @@ class LocalMultiplayerNGame:
             pygame.display.flip()
             clock.tick(60)
         return None
+
 
 
 class MultiplayerModeScreen:
@@ -23870,8 +23845,8 @@ class NetworkGame:
         self.is_host   = is_host
         self.conn      = conn
         self.mode      = mode
-        self.seed      = seed if seed else generate_seed()
         self.custom_map = custom_map  # same map dict on both peers — sent by host during handshake
+        self.seed      = seed if seed else generate_seed()
         self.connected = True
         self.disconnect_reason = None
         self._stop_event = threading.Event()
@@ -23884,6 +23859,7 @@ class NetworkGame:
         if is_host:
             # Host owns the authoritative MultiplayerGame
             self.mp = MultiplayerGame(settings, screen, mode, seed=self.seed, custom_map=custom_map)
+            if 'DEV_TOOLS' in globals(): DEV_TOOLS.register_game(self.mp)
         else:
             # Client holds the last rendered state dict
             self.render_state = None
@@ -23893,6 +23869,7 @@ class NetworkGame:
             # so the client's saved replay has the same board/obstacles too.
             self._client_recorder = MultiplayerGame(settings, screen, mode, seed=self.seed, custom_map=custom_map)
             self._client_recorder.mp_history = []
+            if 'DEV_TOOLS' in globals(): DEV_TOOLS.register_game(self._client_recorder)
 
         # Both peers keep a saved flag so we only persist once per match
         self._mp_saved = False
@@ -24186,6 +24163,8 @@ class NetworkGame:
         clock   = pygame.time.Clock()
 
         while running:
+            frame_start = time.perf_counter()
+            input_start = frame_start
             # Drain receive queue
             while not self._recv_q.empty():
                 try:
@@ -24283,6 +24262,10 @@ class NetworkGame:
                 if event.type == pygame.QUIT:
                     running = False
                 elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                        target_game = getattr(self, 'mp', None) or getattr(self, '_client_recorder', None) or self
+                        DEV_TOOLS.open_panel(self.screen, target_game)
+                        continue
                     k = event.key
                     if k == pygame.K_F11:
                         self.screen = _toggle_fullscreen(self.screen)
@@ -24326,7 +24309,8 @@ class NetworkGame:
             if self.is_host:
                 now = time.time() * 1000
                 if not self.mp.paused and not self.mp.game_over:
-                    if now - self.mp.last_tick >= self.settings.update_rate_ms:
+                    if now - self.mp.last_tick >= DEV_TOOLS.scaled_update_interval(self.settings.update_rate_ms):
+                        DEV_TOOLS.apply_frame_cheats(self.mp)
                         self.mp.tick()
                         self.mp.last_tick = now
                 # Send state every frame so the client stays fresh
@@ -24349,8 +24333,16 @@ class NetworkGame:
                     self._mp_saved = True
 
             _legacy_nav_draw(locals().get('self'))
+            render_start = time.perf_counter()
+            # The game draw/client draw already happened above.  Render time here
+            # intentionally measures only the DEV overlay/flip bookkeeping.
+            DEV_TOOLS.draw_dev_indicator(self.screen, replay=False)
+            render_ms = (time.perf_counter() - render_start) * 1000.0
+            frame_ms = clock.tick(60)
+            input_ms = (time.perf_counter() - input_start) * 1000.0
+            target = self.mp if self.is_host else self._client_recorder
+            _dev_game_frame_hook(target, frame_ms, render_ms=render_ms, input_ms=input_ms)
             pygame.display.flip()
-            clock.tick(60)
 
         # Cleanup: stop receiver and close the socket cleanly so daemon threads
         # cannot outlive the game screen or keep a launcher process alive.
@@ -24717,6 +24709,10 @@ class VSAIGame:
         self.settings      = settings
         self.screen        = screen
         self.custom_map    = custom_map  # optional Map Editor layout (obstacles + portals)
+        # Seed system — generate one if not provided
+        self.seed = seed if seed else generate_seed()
+        self.rng  = SeedRNG(self.seed)
+        self.cosmetic_rng = random.Random(seed_to_int(f'{self.seed}:cosmetic'))
         if ai_configs is None:
             count = max(0, min(4, int(ai_count or 0)))
             self.ai_configs = _normalize_ai_configs(
@@ -24730,10 +24726,6 @@ class VSAIGame:
         )
         self.ai_names = [cfg['name'] for cfg in self.ai_configs]
         self.ai_skins = [cfg['skin'] for cfg in self.ai_configs]
-        # Seed system — generate one if not provided
-        self.seed = seed if seed else generate_seed()
-        self.rng  = SeedRNG(self.seed)
-        self.cosmetic_rng = random.Random(seed_to_int(f'{self.seed}:cosmetic'))
         self.ai_engines = [
             SnakeAI(cfg['difficulty'], rng=SeedRNG(self.seed + f'_ai{i}'))
             for i, cfg in enumerate(self.ai_configs)
@@ -24743,6 +24735,8 @@ class VSAIGame:
             self._enc_touch(f"ai_{cfg['difficulty']}", encountered=1)
         self._init_layout()
         self.reset()
+        if 'DEV_TOOLS' in globals():
+            DEV_TOOLS.register_game(self)
 
     # ── layout ──────────────────────────────────────────────────────────
 
@@ -24944,7 +24938,7 @@ class VSAIGame:
     def _new_head(self, snake, direction):
         hx, hy = snake[0]
         dx, dy = direction
-        if self.settings.wall_collision:
+        if self.settings.wall_collision and not getattr(self, '_dev_no_wall_collision', False):
             nx, ny = hx + dx, hy + dy
             if not (0 <= nx < self.board_width and 0 <= ny < self.board_height):
                 return None
@@ -25040,6 +25034,8 @@ class VSAIGame:
 
         # ── Collision detection for player ────────────────────────────────
         p1_die = h1 is None
+        if getattr(self, '_dev_no_death', False):
+            p1_die = False
         if h1:
             h1 = _portal_teleport(h1)
             if h1 in obs_set:                         p1_die = True
@@ -25128,18 +25124,20 @@ class VSAIGame:
 
     def _snap(self):
         """Compact JSON-serialisable snapshot of current VS-AI game state."""
-        return {
+        snap = {
             'p1':  [list(c) for c in self.p1_snake],
             'p1s': self.p1_score,
             'p1a': self.p1_alive,
             'ais': [[list(c) for c in s] for s in self.ai_snakes],
             'ass': list(self.ai_scores),
             'aia': list(self.ai_alive),
-            'aic': _copy_json_safe(self.ai_configs),
             'fr':  list(self.fruit_pos) if self.fruit_pos else None,
             'ft':  getattr(self, 'fruit_type', 'regular'),
             'pp':  list(self.powerup_pos) if self.powerup_pos else None,
+            'aic': _copy_json_safe(self.ai_configs),
+            'dev_modified': DEV_TOOLS.modified,
         }
+        return snap
 
     def _load_snap(self, snap):
         """Restore game state from a snapshot dict."""
@@ -25149,6 +25147,9 @@ class VSAIGame:
         self.ai_snakes = [[tuple(c) for c in s] for s in snap['ais']]
         self.ai_scores = list(snap['ass'])
         self.ai_alive  = list(snap['aia'])
+        self.fruit_pos = tuple(snap['fr']) if snap['fr'] else None
+        self.fruit_type = snap.get('ft', 'regular')
+        self.powerup_pos = tuple(snap['pp']) if snap['pp'] else None
         if isinstance(snap.get('aic'), list):
             self.ai_configs = _normalize_ai_configs(
                 snap.get('aic'), len(snap.get('aic')))
@@ -25158,9 +25159,6 @@ class VSAIGame:
             self.ai_difficulty = (
                 self.ai_configs[0]['difficulty'] if self.ai_configs else self.ai_difficulty
             )
-        self.fruit_pos = tuple(snap['fr']) if snap['fr'] else None
-        self.fruit_type = snap.get('ft', 'regular')
-        self.powerup_pos = tuple(snap['pp']) if snap['pp'] else None
 
     def save_score(self):
         """Save player score to the shared high-scores file."""
@@ -25310,8 +25308,10 @@ class VSAIGame:
             self.screen.blit(lbl, (sw // 2 - lbl.get_width() // 2, bar_y - 22))
 
             _legacy_nav_draw(locals().get('self'))
+            DEV_TOOLS.draw_dev_indicator(self.screen, replay=True, snapshot=self.game_history[self._replay_idx] if self.game_history else None)
             pygame.display.flip()
             render_ms = (time.perf_counter() - render_start) * 1000.0
+            _dev_game_frame_hook(self, frame_dt, render_ms=render_ms, replay_ms=replay_ms)
             self.performance_stats.record_frame(
                 frame_dt, render_ms=render_ms, replay_ms=replay_ms,
                 object_counts={
@@ -25417,10 +25417,10 @@ class VSAIGame:
 
         for i in range(self.ai_count):
             fallback = self.AI_COLOURS[i % len(self.AI_COLOURS)]
-            col = AI_SKINS.get(self.ai_skins[i], fallback) if i < len(self.ai_skins) else fallback
-            ac = col['body'] if self.ai_alive[i] else (130, 130, 130)
+            col  = AI_SKINS.get(self.ai_skins[i], fallback) if i < len(self.ai_skins) else fallback
+            ac   = col['body'] if self.ai_alive[i] else (130, 130, 130)
             label_name = self.ai_names[i] if i < len(self.ai_names) else f"{ai_lbl} {i+1}"
-            ais = hf.render(f"{label_name}: {self.ai_scores[i]}", True, ac)
+            ais  = hf.render(f"{label_name}: {self.ai_scores[i]}", True, ac)
             self.screen.blit(ais, (sw - ais.get_width() - 10 - i * 130, 8))
 
         hint = sf.render(
@@ -25526,6 +25526,9 @@ class VSAIGame:
 
         while running:
             frame_dt = min(float(clock.tick(60)), 250.0)
+            raw_frame_dt = frame_dt
+            frame_dt = DEV_TOOLS.scale_dt(frame_dt)
+            input_start = time.perf_counter()
             update_ms = 0.0
             ai_ms = 0.0
             render_ms = 0.0
@@ -25542,6 +25545,8 @@ class VSAIGame:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_F11:
                         self.screen = _toggle_fullscreen(self.screen)
+                    elif event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                        DEV_TOOLS.open_panel(self.screen, self)
                     elif event.key == pygame.K_ESCAPE:
                         running = False
                     elif event.key == pygame.K_r and self.game_over:
@@ -25571,12 +25576,14 @@ class VSAIGame:
                     self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
                     self._init_layout()
 
+            input_ms = (time.perf_counter() - input_start) * 1000.0
             if not self.paused and not self.game_over:
                 self._sim_time_ms += frame_dt
                 self._update_accumulator_ms += frame_dt
                 update_start = time.perf_counter()
                 step_ms = max(1.0, self.settings.update_rate_ms)
                 while self._update_accumulator_ms >= step_ms:
+                    DEV_TOOLS.apply_frame_cheats(self)
                     self.tick()
                     ai_ms += getattr(self, '_last_ai_time_ms', 0.0)
                     self._update_accumulator_ms -= step_ms
@@ -25590,7 +25597,10 @@ class VSAIGame:
 
             render_start = time.perf_counter()
             self.draw()
+            DEV_TOOLS.draw_ai_overlay(self.screen, self)
+            DEV_TOOLS.draw_dev_indicator(self.screen, replay=False)
             render_ms = (time.perf_counter() - render_start) * 1000.0
+            _dev_game_frame_hook(self, raw_frame_dt, update_ms=update_ms, render_ms=render_ms, input_ms=input_ms, ai_ms=ai_ms)
             self.performance_stats.record_frame(
                 frame_dt,
                 update_ms=update_ms, render_ms=render_ms, ai_ms=ai_ms,
@@ -25618,7 +25628,6 @@ class PlayMenuScreen:
 
     def run(self):
         clock = pygame.time.Clock()
-        has_continue = any(bool(_load_game_settings(ctx, {})) for ctx in _GAME_CONTEXTS)
         while True:
             sw, sh = self.screen.get_width(), self.screen.get_height()
             self.screen.fill(COLORS['dark_blue'])
@@ -25637,29 +25646,20 @@ class PlayMenuScreen:
             self.screen.blit(title, (sw // 2 - title.get_width() // 2, int(sh * 0.15)))
 
             btn_w = max(220, int(sw * 0.32))
-            btn_h = max(50, int(sh * 0.085))
-            gap = int(sh * 0.022)
-            cy = int(sh * 0.30)
-            continue_rect = pygame.Rect(sw // 2 - btn_w // 2, cy, btn_w, btn_h)
-            sp_rect = pygame.Rect(sw // 2 - btn_w // 2, cy + btn_h + gap, btn_w, btn_h)
-            mp_rect = pygame.Rect(sw // 2 - btn_w // 2, cy + (btn_h + gap) * 2, btn_w, btn_h)
-            back_rect = pygame.Rect(sw // 2 - btn_w // 2, cy + (btn_h + gap) * 3, btn_w, btn_h)
+            btn_h = max(50, int(sh * 0.09))
+            gap = int(sh * 0.03)
+            cy = int(sh * 0.35)
 
-            if has_continue:
-                pygame.draw.rect(self.screen, (0, 150, 120), continue_rect, border_radius=10)
+            sp_rect = pygame.Rect(sw // 2 - btn_w // 2, cy, btn_w, btn_h)
+            mp_rect = pygame.Rect(sw // 2 - btn_w // 2, cy + btn_h + gap, btn_w, btn_h)
+            back_rect = pygame.Rect(sw // 2 - btn_w // 2, cy + (btn_h + gap) * 2 + gap, btn_w, btn_h)
+
             pygame.draw.rect(self.screen, COLORS['green'], sp_rect, border_radius=10)
             pygame.draw.rect(self.screen, (0, 130, 180), mp_rect, border_radius=10)
             pygame.draw.rect(self.screen, COLORS['button'], back_rect, border_radius=10)
 
-            labels = []
-            if has_continue:
-                labels.append((continue_rect, "Continue"))
-            labels.extend([
-                (sp_rect, get_text(self.settings.language, 'singleplayer_title')),
-                (mp_rect, get_text(self.settings.language, 'multiplayer_local_title')),
-                (back_rect, get_text(self.settings.language, 'back')),
-            ])
-            for rect, label in labels:
+            for rect, label in ((sp_rect, get_text(self.settings.language, 'singleplayer_title')), (mp_rect, get_text(self.settings.language, 'multiplayer_local_title')),
+                                 (back_rect, get_text(self.settings.language, 'back'))):
                 surf = render_fit(bf, label, COLORS['white'], rect.width)
                 self.screen.blit(surf, surf.get_rect(center=rect.center))
 
@@ -25678,8 +25678,6 @@ class PlayMenuScreen:
                         return None
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     mp = event.pos
-                    if has_continue and continue_rect.collidepoint(mp):
-                        return 'continue'
                     if sp_rect.collidepoint(mp):
                         return 'singleplayer'
                     if mp_rect.collidepoint(mp):
@@ -27531,10 +27529,17 @@ class ScreenManager:
         if previous is not None:
             self._stack.append(previous)
         self._enter(adapter)
+        _legacy_started_at = time.perf_counter()
         try:
             result = adapter.run()
             return result
         finally:
+            _dev_draw_hook = globals().get('_dev_draw_loading_hook')
+            if callable(_dev_draw_hook):
+                try:
+                    _dev_draw_hook(name, (time.perf_counter() - _legacy_started_at) * 1000.0)
+                except Exception:
+                    pass
             self._exit(adapter)
             if self._stack:
                 self.current_screen = self._stack.pop()
@@ -27847,6 +27852,12 @@ class _SimpleMenuScreen:
                     sys.exit()
                 elif event.type == pygame.VIDEORESIZE:
                     self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
+                elif (event.type == pygame.KEYDOWN and event.key == pygame.K_F8
+                      and 'DEV_TOOLS' in globals() and DEV_TOOLS.unlocked):
+                    DEV_TOOLS.open_panel(self.screen, game=None)
+                elif (event.type == pygame.KEYDOWN and event.key == pygame.K_F9
+                      and 'DEV_TOOLS' in globals() and DEV_TOOLS.unlocked):
+                    DEV_TOOLS.toggle_overlay_hidden()
                 else:
                     action = self.ui.handle_event(event)
                     if action == 'BACK':
@@ -28088,6 +28099,2095 @@ class ModsScreen(_SimpleMenuScreen):
             ui.focus_key(fk)
 
 
+
+# ============================================================================
+# DEV MODE / DEVELOPMENT PANEL
+# ============================================================================
+# Developer-only tooling.  It is deliberately self-contained inside SGF.py,
+# activates lazily, and never performs filesystem/tracemalloc work while it is
+# locked/inactive.  Gameplay cheats are session-local; the unlock flag and
+# presets are stored separately under the existing atomic game-data file.
+
+import csv as _csv_mod
+import gc as _gc_mod
+import platform as _platform_mod
+import zipfile as _zipfile_mod
+import tracemalloc as _tracemalloc_mod
+from collections import deque as _deque_mod
+
+DEV_UNLOCK_SEQUENCE = (
+    pygame.K_UP, pygame.K_UP, pygame.K_DOWN, pygame.K_DOWN,
+    pygame.K_LEFT, pygame.K_RIGHT, pygame.K_LEFT, pygame.K_RIGHT,
+    pygame.K_b, pygame.K_a,
+)
+
+DEV_CATEGORIES = (
+    'Performance', 'Graphs', 'Game', 'Replay', 'Memory', 'Storage',
+    'Rendering', 'System', 'Loading', 'Logs', 'Debug Tools', 'AI Debug',
+    'Cheats', 'Achievements', 'Easter Eggs', 'Export Diagnostics',
+)
+
+DEV_CHEATS = (
+    'next_item_preview', 'infinite_score', 'infinite_length', 'no_death',
+    'no_wall_collision', 'ghost_snake', 'slow_motion', 'speed_boost',
+    'freeze_game', 'invincible_powerups', 'infinite_powerups', 'spawn_item',
+    'force_next_item', 'reveal_grid', 'show_safe_moves', 'show_danger',
+    'auto_collect', 'magnet', 'double_score', 'mega_food', 'tiny_snake',
+    'giant_snake', 'invisible_snake', 'rainbow_snake', 'no_item_cooldown',
+    'all_powerups', 'lucky_mode', 'chaos_mode', 'teleport', 'set_length',
+    'set_score', 'set_seed', 'force_event', 'reverse_controls', 'disco_snake',
+    'rainbow_items', 'giant_fruits', 'tiny_fruits', 'everything_apple',
+    'moon_gravity', 'speed_ramp', 'snake_trail', 'fruit_rain', 'mirror_world',
+    'ai_movement_visualization', 'ai_path_visualization',
+    'ai_prediction_visualization',
+)
+
+DEV_TOGGLES = (
+    'show_hitboxes', 'show_collision_grid', 'show_entity_ids',
+    'show_coordinates', 'show_fps', 'show_frame_time', 'show_render_areas',
+    'show_mouse_position', 'show_ai', 'show_ai_movement', 'show_ai_path',
+    'show_ai_target', 'show_ai_prediction', 'show_ai_decision',
+    'show_ai_danger', 'show_ai_safe', 'show_ai_vision', 'show_ai_collision',
+    'show_ai_evaluation', 'show_ai_history',
+)
+
+_DEV_FRUITS = (
+    'regular', 'golden', 'blue', 'green', 'orange', 'purple', 'yellow', 'pink',
+    'cyan', 'lime', 'brown', 'teal', 'navy', 'coral', 'maroon', 'olive',
+    'mint', 'lavender', 'turquoise', 'beige', 'cream', 'salmon', 'indigo',
+    'crimson', 'gold', 'auto_tracking',
+)
+
+
+def _dev_safe_text(value, fallback='N/A'):
+    if value is None or value == '':
+        return fallback
+    return str(value)
+
+
+def _dev_bool(value):
+    return bool(value)
+
+
+def _dev_get_memory_bytes():
+    """Best-effort current process RSS. Returns None rather than inventing."""
+    try:
+        if sys.platform.startswith('linux'):
+            with open('/proc/self/status', 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        parts = line.split()
+                        return int(parts[1]) * 1024 if len(parts) >= 2 else None
+        if sys.platform == 'win32':
+            try:
+                import psutil as _psutil
+                return int(_psutil.Process().memory_info().rss)
+            except Exception:
+                return None
+        try:
+            import resource as _resource
+            rss = int(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+            # Linux reports KiB, macOS reports bytes.
+            return rss if sys.platform == 'darwin' else rss * 1024
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _dev_process_cpu_percent(prev_cpu, prev_wall, now_cpu=None, now_wall=None):
+    if prev_cpu is None or prev_wall is None:
+        return None, now_cpu or time.process_time(), now_wall or time.perf_counter()
+    now_cpu = time.process_time() if now_cpu is None else now_cpu
+    now_wall = time.perf_counter() if now_wall is None else now_wall
+    wall = now_wall - prev_wall
+    if wall <= 0:
+        return None, now_cpu, now_wall
+    # Process CPU percentage normalized to one CPU core.  This is portable and
+    # clearly reflects process CPU time; it is not a hardware-wide utilisation.
+    return max(0.0, min(10000.0, (now_cpu - prev_cpu) / wall * 100.0)), now_cpu, now_wall
+
+
+class DevTelemetry:
+    """60-second circular performance history and diagnostic sampler."""
+    MAX_SECONDS = 60.0
+    SAMPLE_LIMIT = 4096
+    METRICS = (
+        'fps', 'frame_ms', 'cpu_percent', 'memory_mb', 'allocation_mb_s',
+        'update_ms', 'render_ms', 'input_ms', 'other_ms', 'gc_ms',
+        'frame_spikes', 'max_frame_ms', 'loaded_assets', 'active_entities',
+        'particles', 'ai_ms', 'replay_ms', 'ui_ms',
+    )
+
+    def __init__(self):
+        self.enabled = False
+        self.started_at = 0.0
+        self.last_sample_at = 0.0
+        self.samples = _deque_mod(maxlen=self.SAMPLE_LIMIT)
+        self.loading = _deque_mod(maxlen=128)
+        self.spikes = _deque_mod(maxlen=128)
+        self.gc_samples = _deque_mod(maxlen=self.SAMPLE_LIMIT)
+        self._prev_cpu = None
+        self._prev_wall = None
+        self._prev_alloc = None
+        self.max_frame_ms = 0.0
+        self.total_frames = 0
+        self._tick = 0
+        self._gc_start = None
+        self._gc_elapsed_ms = 0.0
+
+    def activate(self):
+        if self.enabled:
+            return
+        self.enabled = True
+        self.started_at = time.perf_counter()
+        self.last_sample_at = self.started_at
+        self._prev_cpu = time.process_time()
+        self._prev_wall = self.started_at
+        self._prev_alloc = None
+        try:
+            if self._gc_callback not in _gc_mod.callbacks:
+                _gc_mod.callbacks.append(self._gc_callback)
+        except Exception:
+            pass
+        try:
+            if not _tracemalloc_mod.is_tracing():
+                _tracemalloc_mod.start(8)
+            self._prev_alloc = _tracemalloc_mod.get_traced_memory()[0]
+        except Exception:
+            self._prev_alloc = None
+
+    def deactivate(self):
+        self.enabled = False
+        try:
+            while self._gc_callback in _gc_mod.callbacks:
+                _gc_mod.callbacks.remove(self._gc_callback)
+        except Exception:
+            pass
+        self._gc_start = None
+        self._gc_elapsed_ms = 0.0
+
+    def record_loading(self, name, duration_ms):
+        if not self.enabled:
+            return
+        self.loading.append({
+            'time': time.time(), 'name': str(name),
+            'duration_ms': max(0.0, float(duration_ms)),
+        })
+
+    def _sample_system(self):
+        now = time.perf_counter()
+        cpu, self._prev_cpu, self._prev_wall = _dev_process_cpu_percent(
+            self._prev_cpu, self._prev_wall, time.process_time(), now)
+        mem = _dev_get_memory_bytes()
+        alloc_rate = None
+        try:
+            if _tracemalloc_mod.is_tracing():
+                current = _tracemalloc_mod.get_traced_memory()[0]
+                if self._prev_alloc is not None:
+                    elapsed = max(0.001, now - self.last_sample_at)
+                    alloc_rate = max(-9999.0, (current - self._prev_alloc) / elapsed / 1024.0 / 1024.0)
+                self._prev_alloc = current
+        except Exception:
+            alloc_rate = None
+        return cpu, mem, alloc_rate
+
+    def record_frame(self, frame_ms, *, update_ms=0.0, render_ms=0.0,
+                     input_ms=0.0, gc_ms=0.0, ai_ms=0.0, replay_ms=0.0,
+                     ui_ms=0.0, loaded_assets=0, active_entities=0,
+                     particles=0):
+        if not self.enabled:
+            return
+        frame_ms = max(0.0, float(frame_ms))
+        update_ms = max(0.0, float(update_ms))
+        render_ms = max(0.0, float(render_ms))
+        input_ms = max(0.0, float(input_ms))
+        if gc_ms <= 0.0 and self._gc_elapsed_ms > 0.0:
+            gc_ms = self._gc_elapsed_ms
+            self._gc_elapsed_ms = 0.0
+        gc_ms = max(0.0, float(gc_ms))
+        ai_ms = max(0.0, float(ai_ms))
+        replay_ms = max(0.0, float(replay_ms))
+        ui_ms = max(0.0, float(ui_ms))
+        other_ms = max(0.0, frame_ms - update_ms - render_ms - input_ms - gc_ms - ui_ms)
+        fps = (1000.0 / frame_ms) if frame_ms > 0.0 else 0.0
+        now = time.perf_counter()
+        self._tick += 1
+        if now - self.last_sample_at >= 0.20 or not self.samples:
+            cpu, mem_bytes, alloc_rate = self._sample_system()
+            self.last_sample_at = now
+        else:
+            cpu = self.samples[-1].get('cpu_percent') if self.samples else None
+            mem_bytes = (self.samples[-1].get('memory_bytes') if self.samples else None)
+            alloc_rate = (self.samples[-1].get('allocation_mb_s') if self.samples else None)
+        sample = {
+            't': now - self.started_at,
+            'fps': fps,
+            'frame_ms': frame_ms,
+            'cpu_percent': cpu,
+            'memory_bytes': mem_bytes,
+            'memory_mb': (mem_bytes / 1024.0 / 1024.0) if mem_bytes is not None else None,
+            'allocation_mb_s': alloc_rate,
+            'update_ms': update_ms,
+            'render_ms': render_ms,
+            'input_ms': input_ms,
+            'other_ms': other_ms,
+            'gc_ms': gc_ms,
+            'ai_ms': ai_ms,
+            'replay_ms': replay_ms,
+            'ui_ms': ui_ms,
+            'loaded_assets': int(loaded_assets or 0),
+            'active_entities': int(active_entities or 0),
+            'particles': int(particles or 0),
+        }
+        self.samples.append(sample)
+        self.total_frames += 1
+        self.max_frame_ms = max(self.max_frame_ms, frame_ms)
+        if frame_ms >= 20.0:
+            self.spikes.append({
+                't': sample['t'], 'frame_ms': frame_ms,
+                'tick': self.total_frames,
+                'update_ms': update_ms, 'render_ms': render_ms,
+                'input_ms': input_ms,
+            })
+
+    def metric_values(self, metric):
+        now = self.samples[-1]['t'] if self.samples else 0.0
+        cutoff = now - self.MAX_SECONDS
+        return [s for s in self.samples if s.get('t', 0.0) >= cutoff and s.get(metric) is not None]
+
+    def metric_summary(self, metric):
+        rows = self.metric_values(metric)
+        vals = [float(r[metric]) for r in rows]
+        if not vals:
+            return {'current': None, 'average': None, 'minimum': None, 'maximum': None,
+                    'low_1': None, 'low_0_1': None, 'count': 0}
+        sorted_vals = sorted(vals)
+        n = len(sorted_vals)
+        low_1 = sum(sorted_vals[:max(1, n // 100)]) / max(1, n // 100)
+        low_01 = sum(sorted_vals[:max(1, n // 1000)]) / max(1, n // 1000)
+        if metric == 'fps':
+            # For FPS, low values are the first sorted values.
+            pass
+        elif metric == 'frame_ms':
+            # For milliseconds, "lows" are traditionally long-frame tails.
+            slow = sorted(vals, reverse=True)
+            low_1 = sum(slow[:max(1, n // 100)]) / max(1, n // 100)
+            low_01 = sum(slow[:max(1, n // 1000)]) / max(1, n // 1000)
+        return {
+            'current': vals[-1], 'average': sum(vals) / len(vals),
+            'minimum': min(vals), 'maximum': max(vals),
+            'low_1': low_1, 'low_0_1': low_01, 'count': n,
+        }
+
+    def snapshot(self):
+        rows = list(self.samples)
+        latest = rows[-1] if rows else {}
+        return {
+            'fps': self.metric_summary('fps'),
+            'frame_ms': self.metric_summary('frame_ms'),
+            'cpu_percent': self.metric_summary('cpu_percent'),
+            'memory_mb': self.metric_summary('memory_mb'),
+            'allocation_mb_s': self.metric_summary('allocation_mb_s'),
+            'update_ms': self.metric_summary('update_ms'),
+            'render_ms': self.metric_summary('render_ms'),
+            'input_ms': self.metric_summary('input_ms'),
+            'other_ms': self.metric_summary('other_ms'),
+            'gc_ms': self.metric_summary('gc_ms'),
+            'ai_ms': self.metric_summary('ai_ms'),
+            'replay_ms': self.metric_summary('replay_ms'),
+            'ui_ms': self.metric_summary('ui_ms'),
+            'frame_spikes': len(self.spikes),
+            'max_frame_ms': self.max_frame_ms,
+            'loaded_assets': latest.get('loaded_assets', 0),
+            'active_entities': latest.get('active_entities', 0),
+            'particles': latest.get('particles', 0),
+            'sample_count': len(rows),
+        }
+
+    def export_csv(self, path, metric='frame_ms'):
+        rows = self.metric_values(metric)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            w = _csv_mod.writer(f)
+            w.writerow(['seconds_from_dev_start', metric])
+            for row in rows:
+                w.writerow([f"{row.get('t', 0.0):.6f}", row.get(metric)])
+
+    def clear(self):
+        self.samples.clear(); self.spikes.clear(); self.loading.clear()
+        self.gc_samples.clear(); self.max_frame_ms = 0.0; self.total_frames = 0
+        self.last_sample_at = time.perf_counter()
+        self.started_at = self.last_sample_at
+
+
+class DevStateManager:
+    """Persistent developer unlock + cheat presets; gameplay state is not saved."""
+    def __init__(self):
+        self.unlocked = bool(DEBUG_MODE)
+        self.presets = {}
+        self.last_easter_egg = None
+        self.load()
+
+    def load(self):
+        try:
+            gd = _load_data()
+            data = gd.get('developer', {}) if isinstance(gd, dict) else {}
+            if isinstance(data, dict):
+                self.unlocked = bool(data.get('dev_mode_unlocked', self.unlocked)) or DEBUG_MODE
+                self.presets = data.get('presets', {}) if isinstance(data.get('presets', {}), dict) else {}
+                self.last_easter_egg = data.get('last_easter_egg')
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            gd = _load_data()
+            gd['developer'] = {
+                'dev_mode_unlocked': bool(self.unlocked),
+                'presets': copy.deepcopy(self.presets),
+                'last_easter_egg': self.last_easter_egg,
+            }
+            _save_data(gd)
+        except Exception as exc:
+            try: sgf_log.warning(f'Dev state save failed: {exc}')
+            except Exception: pass
+
+    def unlock(self):
+        if self.unlocked:
+            return False
+        self.unlocked = True
+        self.save()
+        return True
+
+    def save_preset(self, name, cheats, toggles, time_scale):
+        self.presets[str(name)] = {
+            'cheats': {k: bool(v) for k, v in cheats.items() if k in DEV_CHEATS},
+            'toggles': {k: bool(v) for k, v in toggles.items() if k in DEV_TOGGLES},
+            'time_scale': float(time_scale),
+        }
+        self.save()
+
+
+class DevTools:
+    """Session-local developer suite coordinating telemetry, cheats, and UI."""
+    def __init__(self):
+        self.state = DevStateManager()
+        self.telemetry = DevTelemetry()
+        self.active = False
+        self.current_game = None
+        self.current_panel = None
+        self.cheats = {k: False for k in DEV_CHEATS}
+        self.toggles = {k: False for k in DEV_TOGGLES}
+        self.time_scale = 1.0
+        self.forced_item = None
+        self.forced_powerup = None
+        self.force_event_name = 'GAME_OVER'
+        self.rainbow_phase = 0.0
+        self.modified_reason = set()
+        self.runtime_toasts = _deque_mod(maxlen=8)
+        self._fruit_rain_clock = 0.0
+        self._next_preview = None
+        self._confirm_action = None
+        self.ai_debug_history = _deque_mod(maxlen=256)
+        self.trail_points = _deque_mod(maxlen=96)
+        self.replay_dev_modified = False
+        self.replay_verified = None
+        self.determinism_status = 'NOT VERIFIED'
+        self._one_shot_cheats = {'spawn_item','force_next_item','teleport','set_length','set_score','set_seed','force_event'}
+        # Quick-hide for the in-game debug overlay (hitboxes/grid/FPS/etc.) so
+        # it doesn't have to obstruct gameplay — toggled by F9 or by clicking
+        # the small [DEV -] / [DEV +] tab drawn in the corner, handled
+        # centrally in _legacy_nav_event. The small red "modified" indicator
+        # (draw_dev_indicator) is intentionally NOT affected by this: it's an
+        # integrity signal (also shown on replays) and should stay visible.
+        self.overlay_hidden = False
+        self._overlay_toggle_rect = None
+
+    def toggle_overlay_hidden(self):
+        self.overlay_hidden = not self.overlay_hidden
+
+    @property
+    def unlocked(self):
+        return self.state.unlocked
+
+    @property
+    def modified(self):
+        return bool(self.modified_reason or any(self.cheats.values()) or any(self.toggles.values()))
+
+    def set_active(self, value=True):
+        self.active = bool(value)
+        if self.active:
+            self.telemetry.activate()
+        elif not self.modified:
+            self.telemetry.deactivate()
+
+    def register_game(self, game):
+        self.current_game = game
+        try:
+            if hasattr(game, 'speed_multiplier') and not hasattr(game, '_dev_base_speed_multiplier'):
+                game._dev_base_speed_multiplier = float(getattr(game, 'speed_multiplier', 1.0))
+            if hasattr(game, 'points_multiplier') and not hasattr(game, '_dev_base_points_multiplier'):
+                game._dev_base_points_multiplier = float(getattr(game, 'points_multiplier', 1.0))
+            setattr(game, 'dev_tools', self)
+        except Exception:
+            pass
+
+    def clear_game(self, game=None):
+        if game is None or self.current_game is game:
+            self.current_game = None
+
+    def toast(self, message, seconds=2.0):
+        self.runtime_toasts.append({'message': str(message), 'until': time.time() + seconds})
+
+    def mark_modified(self, reason):
+        self.modified_reason.add(str(reason))
+        self.set_active(True)
+
+    def toggle(self, name):
+        if name not in self.cheats and name not in self.toggles:
+            return False
+        # Action-style cheats are one-shot tools rather than persistent toggles.
+        if name in self._one_shot_cheats:
+            action_map = {
+                'spawn_item': self.spawn_item,
+                'force_next_item': lambda: self.force_next_item(getattr(self.current_game, 'current_fruit_type', 'regular')),
+                'teleport': self.teleport,
+                'set_length': lambda: self.set_length(20),
+                'set_score': lambda: self.set_score(1000),
+                'set_seed': lambda: self.set_seed('DEV-SEED'),
+                'force_event': self.force_event,
+            }
+            ok = bool(action_map[name]())
+            if ok:
+                self.mark_modified(name)
+            return ok
+        container = self.cheats if name in self.cheats else self.toggles
+        container[name] = not container[name]
+        if container[name]:
+            self.mark_modified(name)
+        else:
+            self.modified_reason.discard(name)
+        self._apply_persistent_flags()
+        return container[name]
+
+    def set_cheat(self, name, value=True):
+        if name not in self.cheats:
+            return
+        self.cheats[name] = bool(value)
+        if value:
+            self.mark_modified(name)
+        else:
+            self.modified_reason.discard(name)
+        self._apply_persistent_flags()
+
+    def reset_all(self):
+        self.cheats = {k: False for k in DEV_CHEATS}
+        self.toggles = {k: False for k in DEV_TOGGLES}
+        self.time_scale = 1.0
+        self.forced_item = None
+        self.forced_powerup = None
+        self.modified_reason.clear()
+        self._apply_persistent_flags()
+        if not self.active:
+            self.telemetry.deactivate()
+
+    def _apply_persistent_flags(self):
+        g = self.current_game
+        if g is None:
+            return
+        try:
+            g.invincible = bool(self.cheats['no_death'] or self.cheats['invincible_powerups'])
+            g._dev_no_wall_collision = bool(self.cheats['no_wall_collision'])
+            g._dev_no_death = bool(self.cheats['no_death'])
+            g._dev_time_scale = float(self.time_scale)
+            g.ghost_mode = bool(self.cheats['ghost_snake'])
+            if self.cheats['speed_boost']:
+                g.speed_multiplier = 0.5
+            elif self.cheats['slow_motion']:
+                g.speed_multiplier = 2.0
+            elif self.cheats['speed_ramp']:
+                g.speed_multiplier = max(0.2, 1.0 - min(0.8, len(getattr(g, 'snake', [])) * 0.01))
+            elif hasattr(g, 'speed_multiplier'):
+                g.speed_multiplier = getattr(g, '_dev_base_speed_multiplier', getattr(g, 'speed_multiplier', 1.0))
+            if self.cheats['double_score']:
+                g.points_multiplier = 2.0
+            elif hasattr(g, 'points_multiplier'):
+                g.points_multiplier = getattr(g, '_dev_base_points_multiplier', getattr(g, 'points_multiplier', 1.0))
+            if self.cheats['infinite_score']:
+                if hasattr(g, 'score'): g.score = max(int(getattr(g, 'score', 0)), 999999999)
+                if hasattr(g, 'p1_score'): g.p1_score = max(int(getattr(g, 'p1_score', 0)), 999999999)
+            if self.cheats['giant_snake']:
+                g._dev_segment_scale = 1.45
+            elif self.cheats['tiny_snake']:
+                g._dev_segment_scale = 0.65
+            else:
+                g._dev_segment_scale = 1.0
+        except Exception:
+            pass
+
+    def apply_frame_cheats(self, game):
+        """Apply cheap, reversible cheat effects around a simulation frame."""
+        if not (self.active or self.modified) or game is None:
+            return
+        try:
+            if hasattr(game, 'score') and self.cheats.get('infinite_score'):
+                game.score = max(int(getattr(game, 'score', 0)), 999999999)
+            if hasattr(game, 'p1_score') and self.cheats.get('infinite_score'):
+                game.p1_score = max(int(getattr(game, 'p1_score', 0)), 999999999)
+
+            if hasattr(game, 'snake') and game.snake:
+                current_len = len(game.snake)
+                if self.cheats.get('infinite_length'):
+                    self._infinite_length_floor = max(getattr(self, '_infinite_length_floor', current_len), current_len)
+                    floor = self._infinite_length_floor
+                    while len(game.snake) < floor:
+                        tail = tuple(game.snake[-1])
+                        game.snake.append(tail)
+                        if hasattr(game, '_snake_set'):
+                            _counter_add(game._snake_set, tail)
+
+                if self.cheats.get('auto_collect') and getattr(game, 'fruit_position', None) is not None:
+                    dx, dy = getattr(game, 'direction', (0, 1))
+                    hx, hy = game.snake[0]
+                    if getattr(game, 'settings', None) is not None and getattr(game.settings, 'wall_collision', True) and not getattr(game, '_dev_no_wall_collision', False):
+                        target = (max(0, min(getattr(game, 'board_width', 1) - 1, hx + dx)), max(0, min(getattr(game, 'board_height', 1) - 1, hy + dy)))
+                    else:
+                        target = ((hx + dx) % max(1, getattr(game, 'board_width', 1)), (hy + dy) % max(1, getattr(game, 'board_height', 1)))
+                    game.fruit_position = target
+                elif self.cheats.get('magnet') and getattr(game, 'fruit_position', None) is not None:
+                    hx, hy = game.snake[0]
+                    fx, fy = game.fruit_position
+                    if fx != hx:
+                        fx += 1 if hx > fx else -1
+                    elif fy != hy:
+                        fy += 1 if hy > fy else -1
+                    game.fruit_position = (max(0, min(getattr(game, 'board_width', 1) - 1, fx)), max(0, min(getattr(game, 'board_height', 1) - 1, fy)))
+
+            if self.cheats.get('everything_apple') and hasattr(game, 'current_fruit_type'):
+                game.current_fruit_type = 'regular'
+                if hasattr(game, 'current_fruit_value'):
+                    game.current_fruit_value = 1
+            elif self.cheats.get('lucky_mode') and hasattr(game, 'current_fruit_type'):
+                game.current_fruit_type = 'golden'
+                if hasattr(game, 'current_fruit_value'):
+                    game.current_fruit_value = 2
+            elif self.cheats.get('mega_food') and hasattr(game, 'current_fruit_value'):
+                game.current_fruit_value = max(10, int(getattr(game, 'current_fruit_value', 1)))
+
+            if self.cheats.get('no_item_cooldown'):
+                if hasattr(game, 'powerup_spawn_timer'):
+                    game.powerup_spawn_timer = -getattr(game, 'powerup_spawn_interval', 0)
+                if hasattr(game, 'powerup_timer'):
+                    game.powerup_timer = -getattr(game, 'powerup_spawn_interval', 0)
+
+            if self.cheats.get('all_powerups') and hasattr(game, 'powerup_position') and getattr(game, 'powerup_position', None) is None:
+                self.spawn_powerup()
+            if self.cheats.get('infinite_powerups') and hasattr(game, 'powerup_position') and getattr(game, 'powerup_position', None) is None:
+                self.spawn_powerup()
+
+            if self.cheats.get('fruit_rain') and hasattr(game, 'generate_fruit'):
+                now = time.perf_counter()
+                if now - self._fruit_rain_clock >= 0.30:
+                    self._fruit_rain_clock = now
+                    game.fruit_position = game.generate_fruit()
+
+            if self.cheats.get('moon_gravity') and hasattr(game, 'next_direction') and hasattr(game, 'direction'):
+                if game.direction != (0, -1):
+                    game.next_direction = (0, 1)
+
+            if self.cheats.get('chaos_mode') and hasattr(game, 'next_direction'):
+                rng = getattr(game, 'rng', random)
+                directions = [(0, -1), (1, 0), (0, 1), (-1, 0)]
+                try:
+                    game.next_direction = rng.choice(directions)
+                except Exception:
+                    game.next_direction = random.choice(directions)
+        except Exception:
+            pass
+
+    def scale_dt(self, frame_dt):
+        if not self.active:
+            return frame_dt
+        ts = 0.0 if self.cheats['freeze_game'] else max(0.0, float(self.time_scale))
+        if self.cheats['speed_boost']:
+            ts *= 2.0
+        if self.cheats['slow_motion']:
+            ts *= 0.5
+        return max(0.0, min(1000.0, frame_dt * ts))
+
+    def scaled_update_interval(self, base_ms):
+        """Map the global DEV time-scale controls to a simulation interval."""
+        if not self.active and not self.modified:
+            return float(base_ms)
+        ts = max(0.0, float(self.time_scale))
+        if self.cheats.get('speed_boost'):
+            ts *= 2.0
+        if self.cheats.get('slow_motion'):
+            ts *= 0.5
+        if self.cheats.get('freeze_game') or ts <= 0.0:
+            return float('inf')
+        return max(1.0, float(base_ms) / ts)
+
+    def reverse_direction_key(self, key):
+        # Mirror World swaps horizontal directions; Reverse Controls swaps both
+        # axes.  When both are active the transforms compose deterministically.
+        if not (self.cheats['reverse_controls'] or self.cheats.get('mirror_world')):
+            return key
+        mirrored = {
+            pygame.K_a: pygame.K_d, pygame.K_d: pygame.K_a,
+            pygame.K_LEFT: pygame.K_RIGHT, pygame.K_RIGHT: pygame.K_LEFT,
+        }
+        reversed_all = {
+            pygame.K_w: pygame.K_s, pygame.K_s: pygame.K_w,
+            pygame.K_UP: pygame.K_DOWN, pygame.K_DOWN: pygame.K_UP,
+            pygame.K_a: pygame.K_d, pygame.K_d: pygame.K_a,
+            pygame.K_LEFT: pygame.K_RIGHT, pygame.K_RIGHT: pygame.K_LEFT,
+        }
+        if self.cheats.get('mirror_world'):
+            key = mirrored.get(key, key)
+        if self.cheats.get('reverse_controls'):
+            key = reversed_all.get(key, key)
+        return key
+
+    def forced_fruit(self):
+        value = self.forced_item
+        self.forced_item = None
+        if value is not None:
+            self.cheats['force_next_item'] = False
+        return value
+
+    def force_next_item(self, fruit_type):
+        if fruit_type in _DEV_FRUITS:
+            self.forced_item = fruit_type
+            self.cheats['force_next_item'] = True
+            self.mark_modified('force_next_item')
+            self.toast(f'Next item forced: {fruit_type}')
+            return True
+        return False
+
+    def force_next_powerup(self, powerup_type):
+        self.forced_powerup = powerup_type
+        self.mark_modified('force_next_powerup')
+
+    def spawn_item(self):
+        g = self.current_game
+        if g is None:
+            return False
+        try:
+            if hasattr(g, 'generate_fruit'):
+                g.fruit_position = g.generate_fruit()
+                return True
+        except Exception as exc:
+            self.toast(f'Spawn failed: {exc}')
+        return False
+
+    def spawn_powerup(self):
+        g = self.current_game
+        if g is None:
+            return False
+        try:
+            if hasattr(g, 'generate_powerup'):
+                g.generate_powerup()
+                return True
+        except Exception as exc:
+            self.toast(f'Power-up spawn failed: {exc}')
+        return False
+
+    def set_score(self, value=1000):
+        g = self.current_game
+        if g is None:
+            return False
+        try:
+            if hasattr(g, 'score'): g.score = int(value)
+            if hasattr(g, 'p1_score'): g.p1_score = int(value)
+            self.mark_modified('set_score')
+            return True
+        except Exception:
+            return False
+
+    def set_length(self, value=20):
+        g = self.current_game
+        if g is None:
+            return False
+        value = max(1, int(value))
+        try:
+            snakes = []
+            if hasattr(g, 'snake'): snakes.append(('snake', g.snake))
+            if hasattr(g, 'p1_snake'): snakes.append(('p1_snake', g.p1_snake))
+            for attr, snake in snakes:
+                if not snake:
+                    continue
+                tail = tuple(snake[-1])
+                while len(snake) < value:
+                    snake.append(tail)
+                while len(snake) > value:
+                    snake.pop()
+                if attr == 'snake':
+                    g._snake_set = _pos_counter(snake)
+            self.mark_modified('set_length')
+            return True
+        except Exception:
+            return False
+
+    def set_seed(self, value='DEV-SEED'):
+        g = self.current_game
+        if g is None:
+            return False
+        try:
+            g.seed = str(value)
+            if hasattr(g, 'reset_game'):
+                g.reset_game()
+            elif hasattr(g, 'reset'):
+                g.reset()
+            self.mark_modified('set_seed')
+            return True
+        except Exception:
+            return False
+
+    def teleport(self):
+        g = self.current_game
+        if g is None:
+            return False
+        try:
+            pos = (max(0, int(getattr(g, 'board_width', 1) // 2)), max(0, int(getattr(g, 'board_height', 1) // 2)))
+            if hasattr(g, 'snake') and g.snake:
+                g.snake[0] = pos
+                g._snake_set = _pos_counter(g.snake)
+            elif hasattr(g, 'p1_snake') and g.p1_snake:
+                g.p1_snake[0] = pos
+            self.mark_modified('teleport')
+            return True
+        except Exception:
+            return False
+
+    def force_event(self):
+        EVENT_BUS.emit(self.force_event_name, source='dev_mode')
+        self.mark_modified('force_event')
+        self.toast(f'Event forced: {self.force_event_name}')
+
+    def trigger_easter_egg(self):
+        self.state.last_easter_egg = datetime.now().isoformat()
+        self.state.save()
+        self.mark_modified('easter_egg')
+        self.toast('Easter egg triggered')
+
+    def save_preset(self, name='DevPreset'):
+        self.state.save_preset(name, self.cheats, self.toggles, self.time_scale)
+        self.toast(f'Preset saved: {name}')
+
+    def load_preset(self, name):
+        data = self.state.presets.get(name)
+        if not isinstance(data, dict):
+            return False
+        for k in self.cheats:
+            self.cheats[k] = bool(data.get('cheats', {}).get(k, False))
+        for k in self.toggles:
+            self.toggles[k] = bool(data.get('toggles', {}).get(k, False))
+        self.time_scale = float(data.get('time_scale', 1.0))
+        self.modified_reason = {k for k, v in self.cheats.items() if v}
+        self.modified_reason.update(k for k, v in self.toggles.items() if v)
+        if abs(self.time_scale - 1.0) > 1e-9:
+            self.modified_reason.add('time_scale')
+        self._apply_persistent_flags()
+        if self.modified:
+            self.set_active(True)
+        return True
+
+    def save_replay(self):
+        g = self.current_game
+        history = list(getattr(g, 'game_history', []) or []) if g is not None else []
+        if not history:
+            self.toast('No replay data to save')
+            return False
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(_user_data_manager.get_replay_dir(), f'dev_replay_{ts}.json')
+        payload = {
+            'schema_version': 1,
+            'game_version': GAME_VERSION,
+            'dev_modified': self.modified,
+            'seed': getattr(g, 'seed', None),
+            'timestamp': datetime.now().isoformat(),
+            'events': history,
+        }
+        try:
+            _atomic_write_json(path, payload)
+            self.replay_dev_modified = bool(self.modified)
+            self.toast(f'Replay saved: {os.path.basename(path)}')
+            return path
+        except Exception as exc:
+            self.toast(f'Replay save failed: {exc}')
+            return False
+
+    def load_replay(self):
+        root = _user_data_manager.get_replay_dir()
+        try:
+            files = sorted((os.path.join(root, n) for n in os.listdir(root) if n.startswith('dev_replay_') and n.endswith('.json')), key=os.path.getmtime, reverse=True)
+        except Exception:
+            files = []
+        if not files:
+            self.toast('No developer replay found')
+            return False
+        try:
+            with open(files[0], 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            history = payload.get('events') if isinstance(payload, dict) else payload
+            if not isinstance(history, list) or not history:
+                raise ValueError('invalid replay events')
+            if self.current_game is not None and hasattr(self.current_game, 'start_replay'):
+                self.current_game.start_replay(history)
+                self.replay_dev_modified = bool(isinstance(payload, dict) and payload.get('dev_modified'))
+                self.replay_verified = None
+                self.determinism_status = 'NOT VERIFIED'
+                self.toast(f'Replay loaded: {os.path.basename(files[0])}')
+                return True
+        except Exception as exc:
+            self.toast(f'Replay load failed: {exc}')
+        return False
+
+    def verify_replay(self):
+        g = self.current_game
+        history = list(getattr(g, 'game_history', []) or []) if g is not None else []
+        if not history:
+            self.toast('No replay data to verify')
+            return False
+        valid = True
+        errors = []
+        for index, snapshot in enumerate(history):
+            if isinstance(snapshot, dict):
+                if 'dev_modified' in snapshot and not isinstance(snapshot['dev_modified'], bool):
+                    valid = False; errors.append(f'{index}: invalid dev flag')
+                if 'snake' not in snapshot and 'p1_snake' not in snapshot and 'snake_state' not in snapshot:
+                    valid = False; errors.append(f'{index}: missing snake state')
+            elif isinstance(snapshot, list):
+                if len(snapshot) < 12:
+                    valid = False; errors.append(f'{index}: legacy snapshot too short')
+            else:
+                valid = False; errors.append(f'{index}: invalid snapshot type')
+            if len(errors) >= 5:
+                break
+        self.replay_verified = bool(valid)
+        self.determinism_status = 'VERIFIED' if valid else 'FAILED'
+        self.toast('Replay verified' if valid else f'Replay verification failed ({errors[0]})')
+        return valid
+
+    def verify_replay_data(self, history):
+        if not isinstance(history, list) or not history:
+            return False
+        return all((isinstance(x, dict) and ('snake' in x or 'p1_snake' in x or 'snake_state' in x)) or (isinstance(x, list) and len(x) >= 12) for x in history)
+
+    def verify_achievements(self):
+        g = self.current_game
+        mgr = getattr(g, 'achievement_manager', None) if g is not None else None
+        if mgr is None:
+            return False
+        try:
+            data = {
+                'score': getattr(g, 'score', getattr(g, 'p1_score', 0)),
+                'snake_length': len(getattr(g, 'snake', getattr(g, 'p1_snake', []))),
+                'games_played': 1,
+                'board_size': getattr(g, 'board_width', getattr(getattr(g, 'settings', None), 'board_size', 10)),
+                'victory': bool(getattr(g, 'victory', False)),
+                'game_over': bool(getattr(g, 'game_over', False)),
+            }
+            mgr.check_achievement_progress(data)
+            self.toast('Achievement conditions checked')
+            return True
+        except Exception:
+            return False
+
+    def unlock_first_locked_achievement(self):
+        g = self.current_game
+        mgr = getattr(g, 'achievement_manager', None) if g is not None else None
+        if mgr is None:
+            return False
+        for aid, achievement in mgr.achievements.items():
+            if not achievement.unlocked:
+                mgr.unlock_achievement(aid)
+                self.mark_modified('force_achievement')
+                self.toast(f'Unlocked: {achievement.name}')
+                return True
+        return False
+
+    def reset_achievements(self):
+        g = self.current_game
+        mgr = getattr(g, 'achievement_manager', None) if g is not None else None
+        if mgr is None:
+            mgr = AchievementManager()
+        for achievement in mgr.achievements.values():
+            achievement.unlocked = False
+            achievement.unlock_time = None
+        mgr.save()
+        self.mark_modified('reset_achievements')
+        self.toast('Achievements reset')
+        return True
+
+    def debug_game_state(self):
+        g = self.current_game
+        if g is None:
+            return {}
+        try:
+            return {
+                'seed': getattr(g, 'seed', None),
+                'state': 'VICTORY' if getattr(g, 'victory', False) else ('GAME OVER' if getattr(g, 'game_over', False) else ('PAUSED' if getattr(g, 'paused', False) else 'PLAYING')),
+                'snake_length': len(getattr(g, 'snake', getattr(g, 'p1_snake', []))),
+                'score': getattr(g, 'score', getattr(g, 'p1_score', 0)),
+                'board': f"{getattr(g, 'board_width', '?')}x{getattr(g, 'board_height', '?')}",
+                'difficulty': getattr(g, 'ai_difficulty', getattr(g, 'difficulty', 'N/A')),
+                'replay_recording': not bool(getattr(g, 'replay_mode', getattr(g, '_replay_mode', False))),
+                'replay_frames': len(getattr(g, 'game_history', [])),
+                'dev_modified': self.modified,
+            }
+        except Exception:
+            return {}
+
+    def memory_stats(self):
+        current = _dev_get_memory_bytes()
+        peak = None
+        traced_current = traced_peak = None
+        try:
+            if _tracemalloc_mod.is_tracing():
+                traced_current, traced_peak = _tracemalloc_mod.get_traced_memory()
+        except Exception:
+            pass
+        try:
+            objs = len(_gc_mod.get_objects())
+        except Exception:
+            objs = None
+        loaded_assets = None
+        textures = surfaces = None
+        try:
+            cache_values = list(getattr(ASSET_MANAGER, '_cache', {}).values())
+            loaded_assets = len(cache_values) + len(getattr(ASSET_MANAGER, '_assets', {}))
+            if pygame.get_init():
+                surfaces = sum(1 for value in cache_values if isinstance(value, pygame.Surface))
+                textures = surfaces
+        except Exception:
+            pass
+        return {
+            'process_memory_mb': (current / 1024.0 / 1024.0) if current is not None else None,
+            'peak_memory_mb': (traced_peak / 1024.0 / 1024.0) if traced_peak is not None else None,
+            'python_objects': objs,
+            'textures': textures,
+            'surfaces': surfaces,
+            'sounds': len(getattr(sounds(), '_sounds', {})) if not NO_AUDIO else 0,
+            'fonts': len(globals().get('font_cache', {})),
+            'loaded_assets': loaded_assets,
+            'unused_assets': None,
+        }
+
+    def storage_stats(self):
+        rows = []
+        for cat in ('config', 'saves', 'replays', 'logs', 'mods', 'themes', 'cache', 'backups', 'crashes', 'profiles'):
+            try:
+                size = _user_data_manager.get_category_size(cat)
+                rows.append((cat, size))
+            except Exception:
+                rows.append((cat, None))
+        return rows
+
+    def rendering_stats(self, screen):
+        size = screen.get_size() if screen else (0, 0)
+        g = self.current_game
+        return {
+            'resolution': f'{size[0]}x{size[1]}',
+            'draw_calls': 'N/A',
+            'sprites': 'N/A',
+            'surfaces': 'N/A',
+            'textures': self.memory_stats().get('loaded_assets'),
+            'particles': len(getattr(g, 'particles', [])) if g is not None else len(getattr(globals().get('MAIN_MENU_INSTANCE', None), 'particles', [])),
+            'overlays': len(getattr(getattr(g, 'runtime', None), '_overlays', [])) if g is not None else 0,
+            'debug_objects': 0,
+        }
+
+    def system_stats(self, screen):
+        info = pygame.display.Info() if pygame.get_init() and pygame.display.get_init() else None
+        refresh = None
+        try:
+            refresh = pygame.display.get_current_refresh_rate()
+        except Exception:
+            refresh = None
+        renderer = None
+        try:
+            renderer = pygame.display.get_driver()
+        except Exception:
+            pass
+        audio_driver = None
+        try:
+            # pygame exposes mixer version, not necessarily the OS audio driver.
+            audio_driver = 'available' if pygame.mixer.get_init() else 'N/A'
+        except Exception:
+            audio_driver = 'N/A'
+        total_ram = None
+        try:
+            if sys.platform.startswith('linux'):
+                with open('/proc/meminfo', 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        if line.startswith('MemTotal:'):
+                            total_ram = f'{int(line.split()[1]) / 1024.0:.0f} MB'
+                            break
+            else:
+                import psutil as _psutil
+                total_ram = f'{_psutil.virtual_memory().total / 1024.0 / 1024.0:.0f} MB'
+        except Exception:
+            total_ram = 'N/A'
+        return {
+            'OS': _platform_mod.platform(),
+            'Architecture': _platform_mod.machine() or 'N/A',
+            'CPU': _platform_mod.processor() or 'N/A',
+            'GPU': 'N/A',
+            'Total RAM': total_ram,
+            'Python': sys.version.split()[0],
+            'Pygame': getattr(getattr(pygame, 'version', None), 'ver', 'N/A'),
+            'Resolution': f'{screen.get_width()}x{screen.get_height()}' if screen else 'N/A',
+            'Refresh rate': _dev_safe_text(refresh),
+            'VSync': _dev_safe_text(getattr(info, 'current_h', None) if False else None),
+            'Fullscreen': 'YES' if _is_fullscreen else 'NO',
+            'Renderer': _dev_safe_text(renderer),
+            'Audio driver': _dev_safe_text(audio_driver),
+        }
+
+    def loading_stats(self):
+        return list(self.telemetry.loading)
+
+    def draw_dev_indicator(self, surface, *, replay=False, snapshot=None):
+        is_dev = self.modified or (bool(replay) and self.replay_dev_modified)
+        if snapshot is not None:
+            is_dev = is_dev or bool(snapshot.get('dev_modified', False))
+        if not is_dev:
+            return
+        label = 'DEV'
+        rect = pygame.Rect(surface.get_width() - 66, 12, 54, 24)
+        pygame.draw.rect(surface, (180, 25, 25), rect, border_radius=5)
+        pygame.draw.rect(surface, (255, 90, 90), rect, width=1, border_radius=5)
+        font = get_font(getattr(getattr(self.current_game, 'settings', None), 'language', 'en'), 'bold', 13)
+        text = font.render(label, True, COLORS['white'])
+        surface.blit(text, text.get_rect(center=rect.center))
+
+    def _draw_metric_overlay(self, surface):
+        if not self.active:
+            return
+        snap = self.telemetry.snapshot()
+        rows = [
+            ('FPS', snap['fps']['current']), ('Frame', snap['frame_ms']['current']),
+        ]
+        y = 42
+        for label, val in rows:
+            if val is None:
+                continue
+            if label == 'FPS':
+                s = f'{label} {val:.1f}'
+            else:
+                s = f'{label} {val:.2f} ms'
+            font = get_font('en', 'bold', 14)
+            surf = font.render(s, True, COLORS['white'])
+            surface.blit(surf, (surface.get_width() - surf.get_width() - 12, y))
+            y += 18
+
+    def _draw_overlay_toggle_tab(self, surface):
+        """Small always-visible tab to hide/show the debug overlay without
+        opening the full panel — so it never has to stay in the way of
+        gameplay. Click it, or press F9 anywhere (handled centrally in
+        _legacy_nav_event), to flip it."""
+        label = 'DEV +' if self.overlay_hidden else 'DEV -'
+        font = get_font('en', 'bold', 12)
+        text = font.render(label, True, COLORS['white'])
+        rect = pygame.Rect(0, 0, text.get_width() + 14, text.get_height() + 8)
+        rect.topright = (surface.get_width() - 12, 40)
+        bg = (70, 70, 90) if self.overlay_hidden else (90, 60, 130)
+        pygame.draw.rect(surface, bg, rect, border_radius=5)
+        pygame.draw.rect(surface, (160, 160, 190), rect, width=1, border_radius=5)
+        surface.blit(text, text.get_rect(center=rect.center))
+        self._overlay_toggle_rect = rect
+
+    def draw_game_overlay(self, surface, game):
+        if not (self.active or self.modified):
+            self._overlay_toggle_rect = None
+            return
+        self._draw_overlay_toggle_tab(surface)
+        if self.overlay_hidden:
+            return
+        # Hitboxes / coordinates are intentionally lightweight overlays.
+        try:
+            if self.toggles.get('show_hitboxes') and hasattr(game, 'snake'):
+                for x, y in game.snake:
+                    r = pygame.Rect(game.board_offset_x + x * game.cell_size,
+                                    game.board_offset_y + y * game.cell_size,
+                                    game.cell_size, game.cell_size)
+                    pygame.draw.rect(surface, (255, 0, 0), r, 1)
+            if self.toggles.get('show_collision_grid') and hasattr(game, '_snake_set'):
+                for x, y in game._snake_set:
+                    r = pygame.Rect(game.board_offset_x + x * game.cell_size,
+                                    game.board_offset_y + y * game.cell_size,
+                                    game.cell_size, game.cell_size)
+                    pygame.draw.rect(surface, (255, 180, 0), r, 1)
+            if self.toggles.get('show_coordinates') and hasattr(game, 'board_width'):
+                font = get_font('en', 'mono', max(9, min(13, game.cell_size // 3)))
+                hx, hy = getattr(game, 'snake', [(0, 0)])[0]
+                txt = font.render(f'HEAD {hx},{hy}', True, COLORS['white'])
+                surface.blit(txt, (12, surface.get_height() - txt.get_height() - 12))
+            if self.toggles.get('show_mouse_position'):
+                mx, my = pygame.mouse.get_pos()
+                font = get_font('en', 'mono', 12)
+                txt = font.render(f'MOUSE {mx},{my}', True, COLORS['light_gray'])
+                surface.blit(txt, (12, 12))
+            if self.toggles.get('show_fps') or self.toggles.get('show_frame_time'):
+                self._draw_metric_overlay(surface)
+            if self.cheats.get('next_item_preview') and hasattr(game, 'current_fruit_type'):
+                preview_type = self._next_preview or game.current_fruit_type
+                self._draw_item_preview(surface, preview_type)
+            if self.cheats.get('reveal_grid') and hasattr(game, 'board_width'):
+                self._draw_reveal_grid(surface, game)
+            if self.toggles.get('show_render_areas') and hasattr(game, 'board_width'):
+                board_rect = pygame.Rect(game.board_offset_x, game.board_offset_y, game.board_width * game.cell_size, game.board_height * game.cell_size)
+                pygame.draw.rect(surface, (120, 180, 255), board_rect, 2)
+            if self.toggles.get('show_entity_ids') and hasattr(game, 'snake'):
+                font = get_font('en', 'mono', max(9, min(12, game.cell_size // 3)))
+                for idx, (x, y) in enumerate(game.snake):
+                    surface.blit(font.render(str(idx), True, (255, 255, 255)), (game.board_offset_x + x * game.cell_size + 2, game.board_offset_y + y * game.cell_size + 2))
+            if (self.toggles.get('show_safe_moves') or self.toggles.get('show_danger') or self.cheats.get('show_safe_moves') or self.cheats.get('show_danger')) and hasattr(game, 'snake') and game.snake:
+                hx, hy = game.snake[0]
+                dirs = ((0,-1,'U'),(0,1,'D'),(-1,0,'L'),(1,0,'R'))
+                occupied = set(getattr(game, '_snake_set', set())) | set(getattr(game, '_obstacles_set', set()))
+                font = get_font('en', 'mono', 9)
+                for dx, dy, label in dirs:
+                    nx, ny = hx + dx, hy + dy
+                    safe = 0 <= nx < getattr(game, 'board_width', 0) and 0 <= ny < getattr(game, 'board_height', 0) and (nx, ny) not in occupied
+                    if self.cheats.get('show_safe_moves') or self.toggles.get('show_ai_safe'):
+                        if safe:
+                            rr = pygame.Rect(game.board_offset_x + nx * game.cell_size, game.board_offset_y + ny * game.cell_size, game.cell_size, game.cell_size)
+                            pygame.draw.rect(surface, (60, 220, 120), rr, 2)
+                    if self.cheats.get('show_danger'):
+                        if not safe:
+                            rr = pygame.Rect(game.board_offset_x + nx * game.cell_size, game.board_offset_y + ny * game.cell_size, game.cell_size, game.cell_size)
+                            pygame.draw.rect(surface, (230, 70, 70), rr, 2)
+                    if self.cheats.get('show_safe_moves') or self.cheats.get('show_danger'):
+                        rr = pygame.Rect(game.board_offset_x + nx * game.cell_size, game.board_offset_y + ny * game.cell_size, game.cell_size, game.cell_size)
+                        surface.blit(font.render(label, True, COLORS['white']), rr.topleft)
+            if self.cheats.get('snake_trail') and hasattr(game, 'snake') and game.snake:
+                hx, hy = game.snake[0]
+                self.trail_points.append((hx, hy, time.time()))
+                for i, (tx, ty, _t) in enumerate(self.trail_points):
+                    alpha = int(20 + 160 * (i + 1) / max(1, len(self.trail_points)))
+                    layer = pygame.Surface((game.cell_size, game.cell_size), pygame.SRCALPHA)
+                    layer.fill((80, 220, 255, alpha))
+                    surface.blit(layer, (game.board_offset_x + tx * game.cell_size, game.board_offset_y + ty * game.cell_size))
+            if self.cheats.get('rainbow_items') and hasattr(game, 'current_fruit_type'):
+                self._next_preview = _DEV_FRUITS[int(time.time() * 4) % len(_DEV_FRUITS)]
+            self.draw_ai_overlay(surface, game)
+            self.draw_dev_indicator(surface, replay=bool(getattr(game, 'replay_mode', getattr(game, '_replay_mode', False))))
+        except Exception:
+            pass
+
+    def _draw_item_preview(self, surface, fruit_type):
+        r = pygame.Rect(12, 72, 34, 34)
+        tmp = pygame.Surface(r.size, pygame.SRCALPHA)
+        try:
+            draw_fruit(tmp, tmp.get_rect(), fruit_type)
+            tmp.set_alpha(90)
+            surface.blit(tmp, r.topleft)
+        except Exception:
+            pass
+
+    def _draw_reveal_grid(self, surface, game):
+        cell = game.cell_size
+        alpha = pygame.Surface((max(1, cell), max(1, cell)), pygame.SRCALPHA)
+        alpha.fill((255, 180, 0, 35))
+        for y in range(game.board_height):
+            for x in range(game.board_width):
+                surface.blit(alpha, (game.board_offset_x + x * cell, game.board_offset_y + y * cell))
+
+    def draw_ai_overlay(self, surface, game):
+        if not any(self.toggles.get(k) for k in DEV_TOGGLES if k.startswith('show_ai_')) and not any(self.cheats.get(k) for k in DEV_CHEATS if k.startswith('ai_')):
+            return
+        engines = getattr(game, 'ai_engines', None) or getattr(game, '_ai_engines', None)
+        if not engines:
+            return
+        try:
+            for idx, engine in enumerate(engines):
+                info = getattr(engine, 'debug_info', None)
+                if not info:
+                    continue
+                colour = (255, 210, 70) if idx == 0 else (100, 220, 255)
+                path = info.get('path') or []
+                bx = getattr(game, 'board_offset_x', 0); by = getattr(game, 'board_offset_y', 0); cs = getattr(game, 'cell_size', 1)
+                if self.toggles.get('show_ai_path') or self.cheats.get('ai_path_visualization'):
+                    pts = [(bx + p[0] * cs + cs // 2, by + p[1] * cs + cs // 2) for p in path]
+                    if len(pts) > 1:
+                        pygame.draw.lines(surface, colour, False, pts, max(1, cs // 8))
+                if self.toggles.get('show_ai_target') and info.get('target') is not None:
+                    tx, ty = info['target']
+                    pygame.draw.circle(surface, colour, (bx + tx * cs + cs // 2, by + ty * cs + cs // 2), max(4, cs // 3), 2)
+                if self.toggles.get('show_ai_safe') or self.cheats.get('ai_prediction_visualization'):
+                    for d, pos, score in info.get('candidates', []):
+                        x, y = pos
+                        rr = pygame.Rect(bx + x * cs, by + y * cs, cs, cs)
+                        pygame.draw.rect(surface, colour if score >= 0 else (220, 80, 80), rr, 1)
+                if self.toggles.get('show_ai_decision') or self.cheats.get('ai_movement_visualization'):
+                    font = get_font('en', 'mono', 13)
+                    label = f'AI {idx+1}: {info.get("chosen")} target={info.get("target")} path={len(path)}'
+                    surface.blit(font.render(label, True, colour), (14, 100 + idx * 18))
+        except Exception:
+            pass
+
+    def export_graph(self, metric, path, surface_size=(900, 500)):
+        rows = self.telemetry.metric_values(metric)
+        surf = pygame.Surface(surface_size, pygame.SRCALPHA)
+        surf.fill((12, 15, 24))
+        pygame.draw.rect(surf, (50, 60, 80), surf.get_rect(), 2)
+        font = get_font('en', 'bold', 22)
+        title = font.render(f'{metric.upper()} — LAST 60 SECONDS', True, COLORS['white'])
+        surf.blit(title, (20, 16))
+        chart = pygame.Rect(60, 70, surface_size[0] - 90, surface_size[1] - 120)
+        pygame.draw.rect(surf, (20, 26, 40), chart)
+        if metric == 'frame_ms':
+            rows_vals = [float(r[metric]) for r in rows if r.get(metric) is not None]
+            if rows_vals:
+                lo_ref, hi_ref = min(min(rows_vals), 33.33), max(max(rows_vals), 33.33)
+                span_ref = max(1e-6, hi_ref - lo_ref)
+                for ref_ms, label in ((16.67, '60 FPS'), (33.33, '30 FPS')):
+                    yy = chart.bottom - int((ref_ms - lo_ref) / span_ref * chart.h)
+                    pygame.draw.line(surf, (100, 90, 70), (chart.x, yy), (chart.right, yy), 1)
+                    surf.blit(get_font('en', 'regular', 12).render(label, True, (165, 155, 135)), (chart.x + 4, max(chart.y, yy - 15)))
+        if rows:
+            vals = [float(r[metric]) for r in rows if r.get(metric) is not None]
+            if vals:
+                lo, hi = min(vals), max(vals)
+                if abs(hi - lo) < 1e-9:
+                    hi = lo + 1.0
+                pts = []
+                for i, v in enumerate(vals):
+                    x = chart.x + int(i * max(1, chart.w - 1) / max(1, len(vals) - 1))
+                    y = chart.bottom - int((v - lo) / (hi - lo) * max(1, chart.h - 1))
+                    pts.append((x, y))
+                if len(pts) > 1:
+                    pygame.draw.lines(surf, (100, 220, 140), False, pts, 2)
+                surf.blit(get_font('en', 'regular', 14).render(f'Min {lo:.3f}', True, COLORS['light_gray']), (chart.x, chart.bottom + 8))
+                surf.blit(get_font('en', 'regular', 14).render(f'Max {hi:.3f}', True, COLORS['light_gray']), (chart.right - 150, chart.bottom + 8))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pygame.image.save(surf, path)
+        return path
+
+    def export_diagnostics(self, screen):
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base = os.path.join(_user_data_manager.get_cache_dir(), f'SGF_Diagnostics_{ts}')
+        os.makedirs(os.path.join(base, 'graphs'), exist_ok=True)
+        snap = self.telemetry.snapshot()
+        with open(os.path.join(base, 'system.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.system_stats(screen), f, indent=2, default=str)
+        with open(os.path.join(base, 'game_state.json'), 'w', encoding='utf-8') as f:
+            json.dump(self.debug_game_state(), f, indent=2, default=str)
+        with open(os.path.join(base, 'replay_info.json'), 'w', encoding='utf-8') as f:
+            g = self.current_game
+            json.dump({
+                'recording': bool(g and not getattr(g, 'replay_mode', False)),
+                'frames': len(getattr(g, 'game_history', [])) if g else 0,
+                'dev_modified': self.modified,
+            }, f, indent=2)
+        with open(os.path.join(base, 'performance.csv'), 'w', newline='', encoding='utf-8') as f:
+            fields = sorted({k for s in self.telemetry.samples for k in s.keys()})
+            w = _csv_mod.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(self.telemetry.samples)
+        with open(os.path.join(base, 'frame_times.csv'), 'w', newline='', encoding='utf-8') as f:
+            w = _csv_mod.writer(f); w.writerow(['t','frame_ms','update_ms','render_ms','input_ms','gc_ms','ai_ms','replay_ms','ui_ms'])
+            for s in self.telemetry.samples:
+                w.writerow([s.get('t'),s.get('frame_ms'),s.get('update_ms'),s.get('render_ms'),s.get('input_ms'),s.get('gc_ms'),s.get('ai_ms'),s.get('replay_ms'),s.get('ui_ms')])
+        with open(os.path.join(base, 'memory.csv'), 'w', newline='', encoding='utf-8') as f:
+            w = _csv_mod.writer(f); w.writerow(['t','memory_mb','allocation_mb_s'])
+            for s in self.telemetry.samples:
+                w.writerow([s.get('t'), s.get('memory_mb'), s.get('allocation_mb_s')])
+        with open(os.path.join(base, 'loading_times.csv'), 'w', newline='', encoding='utf-8') as f:
+            w = _csv_mod.writer(f); w.writerow(['name','duration_ms','time']);
+            for row in self.telemetry.loading: w.writerow([row['name'], row['duration_ms'], row['time']])
+        with open(os.path.join(base, 'logs.txt'), 'w', encoding='utf-8') as f:
+            with _log_ring_lock:
+                f.write('\n'.join(_LOG_RING_BUFFER))
+        for metric in ('fps', 'frame_ms', 'memory_mb', 'cpu_percent'):
+            try:
+                self.export_graph(metric, os.path.join(base, 'graphs', f'{metric}.png'))
+            except Exception:
+                pass
+        zip_path = os.path.join(_user_data_manager.get_log_dir(), f'SGF_Diagnostics_{ts}.zip')
+        try:
+            with _zipfile_mod.ZipFile(zip_path, 'w', _zipfile_mod.ZIP_DEFLATED) as zf:
+                for root, _dirs, files in os.walk(base):
+                    for fn in files:
+                        full = os.path.join(root, fn)
+                        zf.write(full, os.path.relpath(full, base))
+        finally:
+            import shutil as _shutil
+            _shutil.rmtree(base, ignore_errors=True)
+        self.toast(f'Diagnostics exported: {os.path.basename(zip_path)}', 3.5)
+        return zip_path
+
+    def open_panel(self, screen, game=None):
+        if not self.unlocked:
+            return False
+        self.register_game(game) if game is not None else None
+        previous_paused = getattr(game, 'paused', None) if game is not None else None
+        if game is not None and hasattr(game, 'paused'):
+            try: game.paused = True
+            except Exception: pass
+        self.set_active(True)
+        runtime = getattr(game, 'runtime', None) if game is not None else None
+        self.current_panel = DevPanelScreen(self, screen, game=game)
+        if runtime is not None and hasattr(runtime, 'set_modal'):
+            try: runtime.set_modal(self.current_panel)
+            except Exception: pass
+        try:
+            self.current_panel.run()
+        finally:
+            if runtime is not None and hasattr(runtime, 'clear_modal'):
+                try: runtime.clear_modal()
+                except Exception: pass
+            self.current_panel = None
+            if game is not None and previous_paused is not None:
+                try: game.paused = previous_paused
+                except Exception: pass
+            # Keep telemetry/debug sampling active only while the game is still
+            # modified or a persistent debug toggle remains enabled.
+            self.set_active(self.modified)
+        return True
+
+    def handle_hotkey(self, key, screen, game=None):
+        if key == pygame.K_F8 and self.unlocked:
+            self.open_panel(screen, game)
+            return True
+        return False
+
+
+DEV_TOOLS = DevTools()
+
+DEV_MODE_INTEGRATION_METADATA = {
+    'artifact': 'SGF_DEV_MODE_IMPLEMENTATION.patch',
+    'owner': 'Integrated Development / Debugging Suite',
+    'added_symbols': [
+        'DevTelemetry', 'DevStateManager', 'DevTools', 'DevPanelScreen',
+        'DEV_TOOLS', 'DEV_MODE_INTEGRATION_METADATA', 'DEV_CATEGORIES',
+        'DEV_CHEATS', 'DEV_TOGGLES', 'DEV_UNLOCK_SEQUENCE',
+    ],
+    'integration_points': [
+        'MainMenu hidden unlock sequence + DEV menu entry',
+        'singleplayer, VS-AI, local multiplayer and network-game registration',
+        'replay snapshots / indicators / verification',
+        'SnakeAI decision tracing without replacing the AI algorithm',
+        'existing UserDataManager / atomic save / logging / EventBus reuse',
+    ],
+    'performance_contract': {
+        'locked_mode': 'no telemetry sampling, tracemalloc, per-frame filesystem IO, or debug drawing',
+        'active_mode': 'bounded 60-second circular telemetry and optional overlays',
+        'storage': 'diagnostic data only written on explicit save/export actions',
+    },
+    'known_platform_limits': [
+        'GPU usage and VSync report N/A when the platform does not expose them reliably',
+        'legacy blocking screens are timed, but no artificial loading overlay is injected',
+        'exact upcoming RNG fruit preview is limited to forced/current spawn state so gameplay RNG is not consumed',
+    ],
+}
+
+
+def _dev_draw_loading_hook(name, duration_ms):
+    try:
+        if DEV_TOOLS.active:
+            DEV_TOOLS.telemetry.record_loading(name, duration_ms)
+    except Exception:
+        pass
+
+
+def _dev_game_frame_hook(game, frame_dt, *, update_ms=0.0, render_ms=0.0,
+                         input_ms=0.0, gc_ms=0.0, ai_ms=0.0,
+                         replay_ms=0.0, ui_ms=0.0):
+    if not DEV_TOOLS.active:
+        return
+    loaded_assets = 0
+    try:
+        loaded_assets = len(getattr(ASSET_MANAGER, '_cache', {}))
+    except Exception:
+        pass
+    active_entities = 0
+    for attr in ('snake', 'p1_snake', 'ai_snakes', 'obstacles', 'moving_obstacles', 'active_powerups'):
+        val = getattr(game, attr, None)
+        if isinstance(val, int):
+            active_entities += val
+        elif isinstance(val, (list, tuple, dict, set)):
+            active_entities += len(val)
+    particles = len(getattr(game, 'particles', [])) if hasattr(game, 'particles') else 0
+    DEV_TOOLS.telemetry.record_frame(
+        frame_dt * 1000.0 if frame_dt < 10.0 else frame_dt,
+        update_ms=update_ms, render_ms=render_ms, input_ms=input_ms,
+        gc_ms=gc_ms, ai_ms=ai_ms, replay_ms=replay_ms, ui_ms=ui_ms,
+        loaded_assets=loaded_assets, active_entities=active_entities, particles=particles,
+    )
+
+
+def _dev_annotate_snapshot(snapshot):
+    if isinstance(snapshot, dict):
+        snapshot = copy.deepcopy(snapshot)
+        snapshot['dev_modified'] = DEV_TOOLS.modified
+    return snapshot
+
+
+def _dev_patch_replay_history(history):
+    if not isinstance(history, list):
+        return history
+    return [_dev_annotate_snapshot(x) for x in history]
+
+
+# ---- AI decision capture ---------------------------------------------------
+# Wrapped after the class definition so no AI algorithm is duplicated or
+# changed when Dev Mode is locked.
+if not getattr(SnakeAI, '_dev_wrapped', False):
+    _original_snake_ai_choose_direction = SnakeAI.choose_direction
+    def _dev_choose_direction(self, *args, **kwargs):
+        dev = globals().get('DEV_TOOLS')
+        if dev is None or not dev.active:
+            return _original_snake_ai_choose_direction(self, *args, **kwargs)
+        started = time.perf_counter()
+        result = _original_snake_ai_choose_direction(self, *args, **kwargs)
+        try:
+            snake = args[0] if args else kwargs.get('snake', [])
+            occupied = args[1] if len(args) > 1 else kwargs.get('occupied', [])
+            fruit = args[2] if len(args) > 2 else kwargs.get('fruit')
+            bw = args[3] if len(args) > 3 else kwargs.get('board_w', 0)
+            bh = args[4] if len(args) > 4 else kwargs.get('board_h', 0)
+            wall = kwargs.get('wall_collision', True)
+            blocked = set(map(tuple, occupied))
+            if len(snake) > 1: blocked.update(map(tuple, snake[1:]))
+            candidates = []
+            for d in SnakeAI.DIRS:
+                nxt = self._step(tuple(snake[0]), d, (bw, bh, wall)) if snake else None
+                safe = nxt is not None and nxt not in blocked
+                score = -1.0
+                if safe:
+                    score = -float(abs(nxt[0]-fruit[0]) + abs(nxt[1]-fruit[1])) if fruit else 0.0
+                candidates.append((d, nxt, score))
+            target = None
+            try:
+                target = self._best_target(tuple(snake[0]), fruit, kwargs.get('powerup_pos'), (bw, bh, wall), margin=2)
+            except Exception:
+                target = fruit
+            path = []
+            if target is not None and snake:
+                try:
+                    path = self._bfs(tuple(snake[0]), tuple(target), blocked, (bw, bh, wall), {}, shuffle=False) or []
+                except Exception:
+                    path = []
+            self.debug_info = {
+                'chosen': result, 'target': target, 'path': path,
+                'candidates': candidates, 'head': tuple(snake[0]) if snake else None,
+                'duration_ms': (time.perf_counter() - started) * 1000.0,
+                'difficulty': getattr(self, 'difficulty', 'N/A'),
+            }
+            dev.ai_debug_history.append(copy.deepcopy(self.debug_info))
+        except Exception:
+            pass
+        return result
+    SnakeAI.choose_direction = _dev_choose_direction
+    SnakeAI._dev_wrapped = True
+
+
+class DevPanelScreen:
+    """Tabbed developer panel.  Uses the existing SGF font/theme helpers and
+    simple hit regions; it intentionally does not introduce another widget
+    framework just for developer tooling."""
+    def __init__(self, tools, screen, game=None):
+        self.tools = tools
+        self.screen = screen
+        self.game = game
+        self.tab = 0
+        self.scroll = 0
+        self.graph_metric = None
+        self.running = True
+        self.confirm = None
+        self.toast_until = 0.0
+        self.toast_text = ''
+        self._last_size = screen.get_size()
+
+    @property
+    def lang(self):
+        return getattr(getattr(self.game, 'settings', None), 'language', 'en')
+
+    def _t(self, text):
+        # Developer-only copy intentionally falls back to English because the
+        # panel is not part of the normal player-facing translation surface.
+        return str(text)
+
+    def _font(self, size=16, bold=False):
+        return get_font(self.lang, 'bold' if bold else 'regular', size)
+
+    def _button(self, rect, label, *, active=False, danger=False):
+        bg = (95, 105, 145) if active else ((150, 55, 55) if danger else COLORS['button'])
+        hover = rect.collidepoint(pygame.mouse.get_pos())
+        if hover:
+            bg = (120, 135, 190) if not danger else (190, 70, 70)
+        pygame.draw.rect(self.screen, bg, rect, border_radius=6)
+        pygame.draw.rect(self.screen, (120, 130, 165), rect, 1, border_radius=6)
+        s = render_fit(self._font(max(11, min(17, rect.height // 2)), True), str(label), COLORS['white'], rect.w - 6, padding=4)
+        self.screen.blit(s, s.get_rect(center=rect.center))
+        return hover
+
+    def _toggle_row(self, y, label, key, *, description=None):
+        h = 34
+        rect = pygame.Rect(30, y, self.screen.get_width() - 60, h)
+        active = bool(self.tools.cheats.get(key, self.tools.toggles.get(key, False)))
+        self._button(rect, f"{'ON ' if active else 'OFF'}  {label}", active=active)
+        if description:
+            small = self._font(11)
+            ss = small.render(description, True, (165, 175, 195))
+            self.screen.blit(ss, (42, rect.bottom + 1))
+        return rect
+
+    def _action_row(self, y, label, key):
+        rect = pygame.Rect(30, y, self.screen.get_width() - 60, 34)
+        self._button(rect, label)
+        return rect
+
+    def _tabs(self):
+        sw = self.screen.get_width(); n = len(DEV_CATEGORIES)
+        visible = max(4, min(7, sw // 150))
+        self._visible_tab_start = max(0, min(self.tab, max(0, n - visible)))
+        self._visible_tab_end = min(n, self._visible_tab_start + visible)
+        count = max(1, self._visible_tab_end - self._visible_tab_start)
+        w = max(90, (sw - 40) // count)
+        y = 54
+        for i in range(self._visible_tab_start, self._visible_tab_end):
+            x = 20 + (i - self._visible_tab_start) * w
+            self._button(pygame.Rect(x, y, w - 5, 32), DEV_CATEGORIES[i], active=(i == self.tab))
+        return y + 40
+
+    def _draw_header(self):
+        self.screen.fill((10, 13, 24))
+        title = self._font(26, True).render('DEV MODE', True, (255, 95, 95))
+        self.screen.blit(title, (20, 16))
+        status = 'MODIFIED' if self.tools.modified else 'SAFE'
+        col = (255, 100, 100) if self.tools.modified else (130, 220, 150)
+        st = self._font(13, True).render(status, True, col)
+        self.screen.blit(st, (self.screen.get_width() - st.get_width() - 20, 20))
+
+    def _draw_metric(self, y, label, metric, unit='', allow_graph=True):
+        snap = self.tools.telemetry.snapshot().get(metric, {})
+        cur = snap.get('current')
+        avg = snap.get('average')
+        if cur is None:
+            value = 'N/A'
+        elif unit == 'ms':
+            value = f'{cur:.2f} ms'
+        elif unit == 'fps':
+            value = f'{cur:.1f}'
+        elif unit == 'mb':
+            value = f'{cur:.1f} MB'
+        elif unit == '%':
+            value = f'{cur:.2f}%'
+        elif unit == 'mbps':
+            value = f'{cur:.2f} MB/s'
+        else:
+            value = f'{cur:.2f}' if isinstance(cur, float) else str(cur)
+        rect = pygame.Rect(30, y, self.screen.get_width() - 60, 30)
+        pygame.draw.rect(self.screen, (20, 26, 40), rect, border_radius=5)
+        pygame.draw.rect(self.screen, (55, 65, 85), rect, 1, border_radius=5)
+        self.screen.blit(self._font(14, True).render(label, True, COLORS['white']), (42, y + 6))
+        vs = self._font(14).render(value, True, COLORS['light_gray'])
+        self.screen.blit(vs, (rect.right - vs.get_width() - 50, y + 6))
+        if allow_graph:
+            gr = pygame.Rect(rect.right - 36, y + 5, 26, 20)
+            self._button(gr, 'G')
+        if avg is not None and cur is not None:
+            avg_txt = self._font(10).render(f'avg {avg:.2f}', True, (130, 140, 165))
+            self.screen.blit(avg_txt, (rect.x + 120, y + 8))
+        return rect
+
+    def _draw_performance(self, top):
+        y = top + self.scroll
+        snap = self.tools.telemetry.snapshot()
+        metrics = [
+            ('FPS', 'fps', 'fps'), ('Frame time', 'frame_ms', 'ms'),
+            ('1% low FPS', 'fps', 'fps'), ('0.1% low FPS', 'fps', 'fps'),
+            ('CPU', 'cpu_percent', '%'), ('Memory', 'memory_mb', 'mb'),
+            ('Allocation rate', 'allocation_mb_s', 'mbps'),
+            ('Update time', 'update_ms', 'ms'), ('Render time', 'render_ms', 'ms'),
+            ('Input time', 'input_ms', 'ms'), ('Other time', 'other_ms', 'ms'),
+            ('GC time', 'gc_ms', 'ms'), ('AI time', 'ai_ms', 'ms'),
+            ('Replay time', 'replay_ms', 'ms'), ('UI time', 'ui_ms', 'ms'),
+        ]
+        for label, metric, unit in metrics:
+            if label == '1% low FPS':
+                summary = snap.get('fps', {}); val = summary.get('low_1')
+                self._draw_metric_value(y, label, val, unit); y += 34; continue
+            if label == '0.1% low FPS':
+                summary = snap.get('fps', {}); val = summary.get('low_0_1')
+                self._draw_metric_value(y, label, val, unit); y += 34; continue
+            self._draw_metric(y, label, metric, unit); y += 34
+        extras = [
+            f"Frame spikes {snap.get('frame_spikes', 0)}",
+            f"Max frame time {snap.get('max_frame_ms', 0.0):.2f} ms",
+            f"Loaded assets {snap.get('loaded_assets', 0)}",
+            f"Active entities {snap.get('active_entities', 0)}",
+            f"Particles {snap.get('particles', 0)}",
+        ]
+        for txt in extras:
+            self.screen.blit(self._font(14).render(txt, True, (185, 195, 210)), (36, y)); y += 22
+        spikes = list(self.tools.telemetry.spikes)[-6:]
+        if spikes:
+            self.screen.blit(self._font(13, True).render('FRAME SPIKES', True, (245, 190, 110)), (36, y + 4)); y += 24
+            for spike in reversed(spikes):
+                line = f"{spike['frame_ms']:.2f} ms   Tick {spike['tick']}   game {spike['update_ms']:.2f} ms   render {spike['render_ms']:.2f} ms"
+                self.screen.blit(self._font(11).render(line, True, (195, 200, 215)), (40, y)); y += 18
+
+    def _draw_metric_value(self, y, label, val, unit):
+        rect = pygame.Rect(30, y, self.screen.get_width() - 60, 30)
+        pygame.draw.rect(self.screen, (20, 26, 40), rect, border_radius=5)
+        self.screen.blit(self._font(14, True).render(label, True, COLORS['white']), (42, y + 6))
+        txt = 'N/A' if val is None else (f'{val:.1f}' if unit == 'fps' else f'{val:.2f} ms')
+        s = self._font(14).render(txt, True, COLORS['light_gray'])
+        self.screen.blit(s, (rect.right - s.get_width() - 50, y + 6))
+        gr = pygame.Rect(rect.right - 36, y + 5, 26, 20)
+        self._button(gr, 'G')
+
+    def _draw_graphs(self, top):
+        y = top + 10
+        metrics = [('FPS', 'fps'), ('Frame time', 'frame_ms'), ('CPU', 'cpu_percent'), ('Memory', 'memory_mb'), ('Update time', 'update_ms'), ('Render time', 'render_ms')]
+        for label, metric in metrics:
+            rect = pygame.Rect(30, y, self.screen.get_width() - 60, 48)
+            self._button(rect, f'VIEW 60s GRAPH  —  {label}')
+            if rect.collidepoint(pygame.mouse.get_pos()) and pygame.mouse.get_pressed()[0]:
+                self.graph_metric = metric
+            y += 56
+        self.screen.blit(self._font(12).render('Click a metric to open its 60-second graph.', True, (150, 160, 180)), (34, y + 5))
+
+    def _draw_game(self, top):
+        y = top + self.scroll
+        data = self.tools.debug_game_state()
+        lines = [
+            f"Seed {data.get('seed', 'N/A')}", f"State {data.get('state', 'N/A')}",
+            f"Board {data.get('board', 'N/A')}", f"Snake length {data.get('snake_length', 'N/A')}",
+            f"Score {data.get('score', 'N/A')}", f"Difficulty {data.get('difficulty', 'N/A')}",
+            f"Replay frames {data.get('replay_frames', 0)}",
+            f"Replay recording {data.get('replay_recording', False)}",
+            f"Deterministic {'YES' if self._determinism_ok() else 'N/A'}",
+            f"DEV modified {'YES' if self.tools.modified else 'NO'}",
+        ]
+        for line in lines:
+            self.screen.blit(self._font(16).render(line, True, (210, 220, 235)), (36, y)); y += 28
+        for key, label in (('show_hitboxes','Show hitboxes'), ('show_collision_grid','Show collision grid'), ('show_entity_ids','Show entity IDs'), ('show_coordinates','Show coordinates'), ('show_mouse_position','Show mouse position')):
+            r = self._toggle_row(y + 10, label, key); y = r.bottom + 8
+
+    def _determinism_ok(self):
+        return bool(self.game and hasattr(self.game, 'deterministic_state_signature'))
+
+    def _draw_replay(self, top):
+        y = top + 10
+        g = self.tools.current_game
+        frames = len(getattr(g, 'game_history', [])) if g else 0
+        duration = (frames * float(getattr(getattr(g, 'settings', None), 'update_rate_ms', 100)) / 1000.0) if g else 0.0
+        lines = [
+            f'Recording: {"ON" if g and not getattr(g, "replay_mode", False) else "OFF"}',
+            f'Size: {frames} snapshots   Duration: {duration:.1f}s', f'Events: {frames}   Max: 2000+',
+            f'Determinism: {self.tools.determinism_status if self.tools.determinism_status != "NOT VERIFIED" else ("SIGNATURE AVAILABLE" if self._determinism_ok() else "N/A")}',
+            f'DEV modified: {"YES" if self.tools.replay_dev_modified or self.tools.modified else "NO"}',
+        ]
+        for line in lines:
+            self.screen.blit(self._font(16).render(line, True, (210,220,235)), (36,y)); y += 26
+        actions = [('START', 'start_replay'), ('STOP', 'stop_replay'), ('SAVE', 'save_replay'), ('LOAD', 'load_replay'), ('VERIFY', 'verify_replay')]
+        for label, key in actions:
+            r = self._action_row(y, label, key); y = r.bottom + 8
+
+    def _draw_memory(self, top):
+        y = top + 10
+        stats = self.tools.memory_stats()
+        for label, key in (
+            ('Process memory','process_memory_mb'), ('Allocation rate','allocation_mb_s'),
+            ('Peak memory','peak_memory_mb'), ('Python objects','python_objects'),
+            ('Textures','textures'), ('Surfaces','surfaces'), ('Sounds','sounds'),
+            ('Fonts','fonts'), ('Loaded assets','loaded_assets'), ('Unused assets','unused_assets'),
+        ):
+            v = stats.get(key)
+            if key.endswith('_mb'):
+                val = 'N/A' if v is None else f'{v:.2f} MB'
+            elif key == 'allocation_mb_s':
+                val = 'N/A' if v is None else f'{v:.2f} MB/s'
+            else:
+                val = 'N/A' if v is None else str(v)
+            self.screen.blit(self._font(14).render(f'{label}: {val}', True, (205,215,230)), (36,y)); y += 24
+
+    def _draw_storage(self, top):
+        y = top + 10
+        total = 0
+        for cat, size in self.tools.storage_stats():
+            mb = (size / 1024.0 / 1024.0) if size is not None else None
+            total += size or 0
+            self.screen.blit(self._font(14).render(f'{cat:10} {"N/A" if mb is None else f"{mb:.2f} MB"}', True, (205,215,230)), (36,y))
+            y += 24
+        self.screen.blit(self._font(17, True).render(f'TOTAL {total/1024.0/1024.0:.2f} MB', True, COLORS['white']), (36,y+6)); y += 38
+        self._action_row(y, 'OPEN DATA FOLDER', 'open_folder')
+        y += 44
+        for cat in ('replays','logs','cache','saves'):
+            self._action_row(y, f'CLEAR {cat.upper()}', f'clear_{cat}'); y += 42
+
+    def _draw_rendering(self, top):
+        y = top + 10
+        for label, val in self.tools.rendering_stats(self.screen).items():
+            self.screen.blit(self._font(14).render(f'{label}: {val}', True, (205,215,230)), (36,y)); y += 24
+        for key, label in (
+            ('show_hitboxes','Show hitboxes'), ('show_collision_grid','Show collision grid'),
+            ('show_entity_ids','Show entity IDs'), ('show_coordinates','Show coordinates'),
+            ('show_fps','Show FPS'), ('show_frame_time','Show frame time'),
+            ('show_render_areas','Show render areas'), ('show_mouse_position','Show mouse position'),
+        ):
+            r = self._toggle_row(y + 6, label, key); y = r.bottom + 7
+
+    def _draw_system(self, top):
+        y = top + 10
+        for k,v in self.tools.system_stats(self.screen).items():
+            self.screen.blit(self._font(14).render(f'{k}: {_dev_safe_text(v)}', True, (205,215,230)), (36,y)); y += 24
+
+    def _draw_loading(self, top):
+        y = top + 10
+        for row in reversed(self.tools.loading_stats()[-16:]):
+            self.screen.blit(self._font(13).render(f"{row['name']}: {row['duration_ms']:.2f} ms", True, (205,215,230)), (36,y)); y += 22
+        if not self.tools.loading_stats():
+            self.screen.blit(self._font(14).render('No loading samples yet.', True, (160,170,190)), (36,y))
+
+    def _draw_logs(self, top):
+        y = top + 8
+        buttons = [('Enable logging','log_on'),('Disable logging','log_off'),('Open log folder','log_folder'),('Clear logs','log_clear')]
+        for label,key in buttons:
+            r = self._action_row(y,label,key); y = r.bottom + 8
+        self.screen.blit(self._font(12).render(f'Current level: {_logging_mod.getLevelName(sgf_log.level)}', True, (165,175,195)), (36,y+4))
+
+    def _draw_debug_tools(self, top):
+        y = top + 10
+        actions = [
+            ('Spawn Apple','spawn_apple'), ('Spawn Power-up','spawn_powerup'), ('Add Snake Segment','add_segment'),
+            ('Remove Segment','remove_segment'), ('Force Achievement','force_achievement'), ('Reset Achievements','reset_achievements'),
+            ('Trigger Easter Egg','easter_egg'), ('Start Replay','start_replay'), ('Stop Replay','stop_replay'),
+            ('Save State','save_state'), ('Load State','load_state'), ('Teleport','teleport'),
+            ('Set Length','set_length'), ('Set Score','set_score'), ('Set Seed','set_seed'), ('Force Event','force_event'),
+        ]
+        for label,key in actions:
+            r = self._action_row(y,label,key); y = r.bottom + 6
+
+    def _draw_ai_debug(self, top):
+        y = top + 8
+        for key,label in (
+            ('show_ai','Show AI'),('show_ai_movement','Show AI movement'),('show_ai_path','Show AI path'),
+            ('show_ai_target','Show AI target'),('show_ai_prediction','Show AI prediction'),('show_ai_decision','Show AI decision'),
+            ('show_ai_danger','Show AI danger zones'),('show_ai_safe','Show AI safe moves'),('show_ai_vision','Show AI vision'),
+            ('show_ai_collision','Show AI collision checks'),('show_ai_evaluation','Show AI evaluation'),('show_ai_history','Show AI movement history'),
+        ):
+            r=self._toggle_row(y,label,key); y=r.bottom+6
+        if self.tools.ai_debug_history:
+            self.screen.blit(self._font(12,True).render('Latest AI decision',True,COLORS['white']),(36,y+4)); y += 24
+            info=self.tools.ai_debug_history[-1]
+            for line in (f"Chosen {info.get('chosen')}", f"Target {info.get('target')}", f"Path {len(info.get('path') or [])}", f"Decision {info.get('duration_ms',0):.3f} ms"):
+                self.screen.blit(self._font(12).render(line,True,(190,200,215)),(40,y)); y+=20
+
+    def _draw_cheats(self, top):
+        y=top+8
+        labels={k:k.replace('_',' ').title() for k in DEV_CHEATS}
+        # A grid keeps the panel usable at 800x600 without a giant list.
+        col_w=(self.screen.get_width()-70)//2
+        items=list(DEV_CHEATS)
+        for i,key in enumerate(items):
+            row=i//2; col=i%2
+            rect=pygame.Rect(30+col*col_w, y+row*36, col_w-8, 30)
+            self._button(rect, f"{'ON ' if self.tools.cheats[key] else 'OFF'} {labels[key]}", active=self.tools.cheats[key])
+        rows=(len(items)+1)//2
+        y += rows*36 + 8
+        self.screen.blit(self._font(12).render(f'Time Scale: {self.tools.time_scale:.2f}x  (click cycles)',True,(195,205,220)),(34,y)); y+=22
+        self._action_row(y,'SAVE PRESET','save_preset'); y+=42
+        self._action_row(y,'LOAD LAST PRESET','load_preset'); y+=42
+        self._action_row(y,'RESET ALL','reset_all')
+
+    def _draw_achievements(self, top):
+        y=top+8
+        mgr=getattr(self.tools.current_game,'achievement_manager',None)
+        if mgr is None:
+            self.screen.blit(self._font(14).render('Achievement manager unavailable.',True,(170,180,195)),(36,y)); return
+        unlocked=sum(1 for a in mgr.achievements.values() if a.unlocked)
+        self.screen.blit(self._font(16,True).render(f'{unlocked}/{len(mgr.achievements)} unlocked',True,COLORS['white']),(36,y)); y+=30
+        self._action_row(y,'FORCE FIRST LOCKED','force_achievement'); y+=42
+        self._action_row(y,'VERIFY CONDITIONS','verify_achievements'); y+=42
+        self._action_row(y,'RESET ALL ACHIEVEMENTS','reset_achievements'); y+=50
+        for a in list(mgr.achievements.values())[:12]:
+            col=(110,220,130) if a.unlocked else (145,150,165)
+            prefix='✓ ' if a.unlocked else '🔒 '
+            self.screen.blit(self._font(13).render(prefix+a.name,col),(38,y)); y+=19
+            if a.unlocked or not getattr(a,'secret',False):
+                desc=str(getattr(a,'description','') or '')
+                if len(desc) > 86: desc = desc[:83] + '...'
+                self.screen.blit(self._font(11).render(desc,True,(150,160,178)),(58,y)); y+=16
+                if a.unlocked:
+                    self.screen.blit(self._font(10).render('Tip: '+desc,True,(135,150,170)),(58,y)); y+=15
+
+    def _draw_easter_eggs(self, top):
+        y=top+12
+        self.screen.blit(self._font(15).render('Discovered: none tracked by the current gameplay build.',True,(185,195,210)),(36,y)); y+=34
+        self._action_row(y,'TRIGGER EASTER EGG','easter_egg'); y+=42
+        self.screen.blit(self._font(12).render(f"Last trigger: {self.tools.state.last_easter_egg or 'N/A'}",True,(155,165,185)),(36,y))
+
+    def _draw_export(self, top):
+        y=top+14
+        self.screen.blit(self._font(16,True).render('Export complete debugging package',True,COLORS['white']),(36,y)); y+=38
+        self.screen.blit(self._font(13).render('Includes performance.csv, memory.csv, frame_times.csv,',True,(185,195,210)),(36,y)); y+=20
+        self.screen.blit(self._font(13).render('system.json, game_state.json, replay_info.json, logs.txt and graphs.',True,(185,195,210)),(36,y)); y+=40
+        self._action_row(y,'EXPORT DIAGNOSTICS','export_diagnostics')
+
+    def _draw_graph(self):
+        metric=self.graph_metric
+        self._draw_header()
+        back=pygame.Rect(20,54,90,32); self._button(back,'BACK')
+        title=self._font(20,True).render(f'{metric.upper()} — LAST 60 SECONDS',True,COLORS['white'])
+        self.screen.blit(title,(130,60))
+        chart=pygame.Rect(50,110,self.screen.get_width()-100,self.screen.get_height()-210)
+        pygame.draw.rect(self.screen,(20,26,40),chart)
+        rows=self.tools.telemetry.metric_values(metric)
+        vals=[float(r[metric]) for r in rows if r.get(metric) is not None]
+        if metric=='frame_ms':
+            for ms,label in ((16.67,'60 FPS'),(33.33,'30 FPS')):
+                if vals:
+                    lo,hi=min(min(vals),ms),max(max(vals),ms); span=max(1e-6,hi-lo)
+                    yy=chart.bottom-int((ms-lo)/span*chart.h)
+                    pygame.draw.line(self.screen,(110,100,80),(chart.x,yy),(chart.right,yy),1)
+                    self.screen.blit(self._font(11).render(label,True,(160,150,130)),(chart.x+4,yy-14))
+        if vals:
+            lo,hi=min(vals),max(vals); span=max(1e-6,hi-lo)
+            pts=[]
+            for i,v in enumerate(vals):
+                x=chart.x+int(i*max(1,chart.w-1)/max(1,len(vals)-1)); y=chart.bottom-int((v-lo)/span*max(1,chart.h-1)); pts.append((x,y))
+            if len(pts)>1: pygame.draw.lines(self.screen,(100,220,140),False,pts,2)
+            stats=self.tools.telemetry.metric_summary(metric)
+            txt=f"Current {stats['current']:.3f}   Average {stats['average']:.3f}   Min {stats['minimum']:.3f}   Max {stats['maximum']:.3f}"
+            low_txt=f"1% low {stats['low_1']:.3f}   0.1% low {stats['low_0_1']:.3f}"
+            self.screen.blit(self._font(12).render(txt,True,(195,205,220)),(50,self.screen.get_height()-96))
+            if metric in ('fps','frame_ms'):
+                self.screen.blit(self._font(12).render(low_txt,True,(175,190,210)),(50,self.screen.get_height()-76))
+        else:
+            self.screen.blit(self._font(16).render('No samples yet.',True,(170,180,195)),chart.center)
+        save=pygame.Rect(self.screen.get_width()-300,self.screen.get_height()-48,130,32)
+        data=pygame.Rect(self.screen.get_width()-160,self.screen.get_height()-48,130,32)
+        self._button(save,'SAVE GRAPH'); self._button(data,'SAVE DATA')
+        return back,save,data
+
+    def _handle_action(self, action):
+        g=self.tools.current_game
+        if action=='open_folder': _user_data_manager.open_data_folder()
+        elif action.startswith('clear_'):
+            cat=action[6:]
+            if self.confirm==action: _user_data_manager.delete_category(cat); self.confirm=None; self.tools.toast(f'Cleared {cat}')
+            else: self.confirm=action; self.tools.toast(f'Click again to clear {cat}')
+        elif action=='log_on': sgf_log.setLevel(_logging_mod.DEBUG if DEBUG_MODE else _logging_mod.INFO); self.tools.toast('Logging enabled')
+        elif action=='log_off': sgf_log.setLevel(_logging_mod.CRITICAL+1); self.tools.toast('Logging disabled')
+        elif action=='log_folder': _user_data_manager.open_data_folder()
+        elif action=='open_terminal':
+            try:
+                if sys.platform == 'win32': subprocess.Popen(['cmd.exe'], cwd=_user_data_manager.get_root_dir())
+                elif sys.platform == 'darwin': subprocess.Popen(['open', '-a', 'Terminal', _user_data_manager.get_root_dir()])
+                else:
+                    launched = False
+                    for term in (['x-terminal-emulator'], ['gnome-terminal'], ['konsole'], ['xterm']):
+                        try:
+                            subprocess.Popen(term, cwd=_user_data_manager.get_root_dir()); launched=True; break
+                        except Exception:
+                            continue
+                    if not launched: raise RuntimeError('No terminal launcher available')
+                self.tools.toast('Terminal opened')
+            except Exception as exc:
+                self.tools.toast(f'Unable to open terminal: {exc}')
+        elif action=='log_clear':
+            path=os.path.join(_user_data_manager.get_log_dir(),'sgf.log')
+            try: open(path,'w',encoding='utf-8').close()
+            except Exception: pass
+        elif action=='export_diagnostics': self.tools.export_diagnostics(self.screen)
+        elif action=='force_achievement': self.tools.unlock_first_locked_achievement()
+        elif action=='verify_achievements': self.tools.verify_achievements()
+        elif action=='reset_achievements': self.tools.reset_achievements()
+        elif action=='easter_egg': self.tools.trigger_easter_egg()
+        elif action=='spawn_powerup': self.tools.spawn_powerup()
+        elif action=='spawn_apple':
+            self.tools.force_next_item('regular'); self.tools.spawn_item()
+        elif action=='add_segment': self.tools.set_length(len(getattr(g,'snake',getattr(g,'p1_snake',[])))+1)
+        elif action=='remove_segment': self.tools.set_length(max(1,len(getattr(g,'snake',getattr(g,'p1_snake',[])))-1))
+        elif action=='teleport': self.tools.teleport()
+        elif action=='set_length': self.tools.set_length(20)
+        elif action=='set_score': self.tools.set_score(1000)
+        elif action=='set_seed': self.tools.set_seed('DEV-SEED')
+        elif action=='force_event': self.tools.force_event()
+        elif action=='save_preset': self.tools.save_preset()
+        elif action=='load_preset':
+            names=sorted(self.tools.state.presets)
+            if names and self.tools.load_preset(names[-1]): self.tools.toast(f'Preset loaded: {names[-1]}')
+            else: self.tools.toast('No saved preset')
+        elif action=='reset_all': self.tools.reset_all()
+        elif action=='start_replay':
+            if g and getattr(g,'game_history',[]):
+                g.start_replay(g.game_history); self.tools.replay_dev_modified = bool(self.tools.modified); self.tools.replay_verified = None; self.tools.determinism_status = 'NOT VERIFIED'
+        elif action=='load_replay':
+            self.tools.load_replay()
+        elif action=='stop_replay':
+            if g: setattr(g,'replay_mode',False); setattr(g,'_replay_mode',False)
+        elif action=='save_replay':
+            self.tools.save_replay()
+        elif action=='verify_replay':
+            self.tools.verify_replay()
+        elif action=='save_state':
+            try:
+                if g is not None and callable(getattr(g, '_snap', None)):
+                    self._saved_state = copy.deepcopy(g._snap())
+                else:
+                    self._saved_state = copy.deepcopy(self.tools.debug_game_state())
+                self.tools.toast('State snapshot saved')
+            except Exception as exc:
+                self.tools.toast(f'Save state failed: {exc}')
+        elif action=='load_state':
+            try:
+                snap = getattr(self, '_saved_state', None)
+                loader = getattr(g, '_load_snap', None) if g is not None else None
+                if snap is None or not callable(loader):
+                    self.tools.toast('No compatible saved state')
+                else:
+                    loader(copy.deepcopy(snap))
+                    self.tools.mark_modified('load_state')
+                    self.tools.toast('State snapshot restored')
+            except Exception as exc:
+                self.tools.toast(f'Load state failed: {exc}')
+
+    def run(self):
+        self.running=True
+        clock=pygame.time.Clock()
+        while self.running:
+            frame_start = time.perf_counter()
+            frame_dt=clock.tick(60)
+            self._draw_header()
+            top=self._tabs()
+            for event in pygame.event.get():
+                if event.type==pygame.QUIT:
+                    self.running=False; continue
+                if event.type==pygame.VIDEORESIZE:
+                    self.screen=pygame.display.set_mode((event.w,event.h),pygame.RESIZABLE); continue
+                if event.type==pygame.KEYDOWN:
+                    if event.key in (pygame.K_ESCAPE, pygame.K_F8): self.running=False; continue
+                    if event.key==pygame.K_LEFT: self.tab=max(0,self.tab-1); continue
+                    if event.key==pygame.K_RIGHT: self.tab=min(len(DEV_CATEGORIES)-1,self.tab+1); continue
+                    if event.key==pygame.K_UP: self.scroll=min(0,self.scroll+50); continue
+                    if event.key==pygame.K_DOWN: self.scroll=max(-2500,self.scroll-50); continue
+                if event.type==pygame.MOUSEWHEEL:
+                    self.scroll=min(0,max(-2500,self.scroll+event.y*45))
+                if event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+                    pos=event.pos
+                    # tab hit detection
+                    start=getattr(self,'_visible_tab_start',0); end=getattr(self,'_visible_tab_end',len(DEV_CATEGORIES)); count=max(1,end-start); w=max(90,(self.screen.get_width()-40)//count)
+                    if 54<=pos[1]<=86:
+                        idx=start+int((pos[0]-20)//w)
+                        if start<=idx<end: self.tab=idx; self.scroll=0; continue
+                    if self.graph_metric:
+                        back=pygame.Rect(20,54,90,32); save=pygame.Rect(self.screen.get_width()-300,self.screen.get_height()-48,130,32); data=pygame.Rect(self.screen.get_width()-160,self.screen.get_height()-48,130,32)
+                        if back.collidepoint(pos): self.graph_metric=None; continue
+                        metric=self.graph_metric
+                        if save.collidepoint(pos):
+                            ts=datetime.now().strftime('%Y%m%d_%H%M%S'); path=os.path.join(_user_data_manager.get_cache_dir(),f'dev_{metric}_{ts}.png'); self.tools.export_graph(metric,path); self.tools.toast(f'Saved {os.path.basename(path)}'); continue
+                        if data.collidepoint(pos):
+                            ts=datetime.now().strftime('%Y%m%d_%H%M%S'); path=os.path.join(_user_data_manager.get_cache_dir(),f'dev_{metric}_{ts}.csv'); self.tools.telemetry.export_csv(path,metric); self.tools.toast(f'Saved {os.path.basename(path)}'); continue
+                    elif pos[1] > 96:
+                        # Section-specific clickable rows
+                        if self.tab==1:
+                            y=top+10
+                            for label,metric in [('FPS','fps'),('Frame time','frame_ms'),('CPU','cpu_percent'),('Memory','memory_mb'),('Update time','update_ms'),('Render time','render_ms')]:
+                                rr=pygame.Rect(30,y,self.screen.get_width()-60,48)
+                                if rr.collidepoint(pos):
+                                    self.graph_metric=metric; self.scroll=0; break
+                                y+=56
+                            if self.graph_metric:
+                                continue
+                        if self.tab==0:
+                            start_y=top+self.scroll
+                            metrics=[('fps','show_fps'),('frame_ms','show_frame_time'),('fps',None),('fps',None),('cpu_percent',None),('memory_mb',None),('allocation_mb_s',None),('update_ms',None),('render_ms',None),('input_ms',None),('other_ms',None),('gc_ms',None),('ai_ms',None),('replay_ms',None),('ui_ms',None)]
+                            for idx,(metric,key) in enumerate(metrics):
+                                rr=pygame.Rect(30,start_y+idx*34,self.screen.get_width()-60,30)
+                                gr=pygame.Rect(rr.right-42,rr.y+4,30,22)
+                                if gr.collidepoint(pos):
+                                    self.graph_metric=metric; self.scroll=0; break
+                                if key and rr.collidepoint(pos): self.tools.toggle(key)
+                        elif self.tab==2:
+                            y=top+self.scroll+10
+                            for key in ('show_hitboxes','show_collision_grid','show_entity_ids','show_coordinates','show_mouse_position'):
+                                rr=pygame.Rect(30,y+10,self.screen.get_width()-60,34)
+                                if rr.collidepoint(pos): self.tools.toggle(key)
+                                y+=42
+                        elif self.tab==6:
+                            y=top+self.scroll+10
+                            keys=['show_hitboxes','show_collision_grid','show_entity_ids','show_coordinates','show_fps','show_frame_time','show_render_areas','show_mouse_position']
+                            # rendering stats occupy 9 rows before toggles; find the toggle area dynamically
+                            y += 8*24 + 8
+                            for key in keys:
+                                rr=pygame.Rect(30,y,self.screen.get_width()-60,34)
+                                if rr.collidepoint(pos): self.tools.toggle(key)
+                                y+=41
+                        elif self.tab==5:
+                            y=top+8
+                            keys=['show_ai','show_ai_movement','show_ai_path','show_ai_target','show_ai_prediction','show_ai_decision','show_ai_danger','show_ai_safe','show_ai_vision','show_ai_collision','show_ai_evaluation','show_ai_history']
+                            for key in keys:
+                                rr=pygame.Rect(30,y,self.screen.get_width()-60,34)
+                                if rr.collidepoint(pos): self.tools.toggle(key)
+                                y+=40
+                        elif self.tab==9:
+                            y=top+8
+                            for key in ('log_on','log_off','log_folder','open_terminal','log_clear'):
+                                rr=pygame.Rect(30,y,self.screen.get_width()-60,34)
+                                if rr.collidepoint(pos): self._handle_action(key)
+                                y+=42
+                        elif self.tab==10:
+                            y=top+10
+                            for i,(label,key) in enumerate([('Spawn Apple','spawn_apple'),('Spawn Power-up','spawn_powerup'),('Add Snake Segment','add_segment'),('Remove Segment','remove_segment'),('Force Achievement','force_achievement'),('Reset Achievements','reset_achievements'),('Trigger Easter Egg','easter_egg'),('Start Replay','start_replay'),('Stop Replay','stop_replay'),('Save State','save_state'),('Load State','load_state'),('Teleport','teleport'),('Set Length','set_length'),('Set Score','set_score'),('Set Seed','set_seed'),('Force Event','force_event')]):
+                                rr=pygame.Rect(30,y,self.screen.get_width()-60,34)
+                                if rr.collidepoint(pos): self._handle_action(key)
+                                y+=42
+                        elif self.tab==12:
+                            col_w=(self.screen.get_width()-70)//2; y=top+8; items=list(DEV_CHEATS)
+                            for i,key in enumerate(items):
+                                row=i//2; col=i%2; rr=pygame.Rect(30+col*col_w,y+row*36,col_w-8,30)
+                                if rr.collidepoint(pos): self.tools.toggle(key)
+                            rows=(len(items)+1)//2; ts_rect=pygame.Rect(30,y+rows*36+4,self.screen.get_width()-60,30)
+                            if ts_rect.collidepoint(pos):
+                                vals=(0.1,0.25,0.5,1.0,2.0,5.0,10.0); self.tools.time_scale=vals[(vals.index(self.tools.time_scale)+1)%len(vals)] if self.tools.time_scale in vals else 1.0; self.tools.mark_modified('time_scale')
+                            save=pygame.Rect(30,y+rows*36+34,self.screen.get_width()-60,34)
+                            reset=pygame.Rect(30,y+rows*36+76,self.screen.get_width()-60,34)
+                            if save.collidepoint(pos): self._handle_action('save_preset')
+                            elif reset.collidepoint(pos): self._handle_action('reset_all')
+                        elif self.tab==13:
+                            y=top+8
+                            if pygame.Rect(30,y+34,self.screen.get_width()-60,34).collidepoint(pos): self._handle_action('force_achievement')
+                            if pygame.Rect(30,y+76,self.screen.get_width()-60,34).collidepoint(pos): self._handle_action('verify_achievements')
+                            if pygame.Rect(30,y+118,self.screen.get_width()-60,34).collidepoint(pos): self._handle_action('reset_achievements')
+                        elif self.tab==14:
+                            y=top+12
+                            if pygame.Rect(30,y+34,self.screen.get_width()-60,34).collidepoint(pos): self._handle_action('easter_egg')
+                        elif self.tab==15:
+                            y=top+14
+                            if pygame.Rect(30,y+58,self.screen.get_width()-60,34).collidepoint(pos): self._handle_action('export_diagnostics')
+            # Draw content after event processing.
+            if self.graph_metric:
+                self._draw_graph()
+            else:
+                top=self._tabs()
+                drawers=(self._draw_performance,self._draw_graphs,self._draw_game,self._draw_replay,self._draw_memory,self._draw_storage,self._draw_rendering,self._draw_system,self._draw_loading,self._draw_logs,self._draw_debug_tools,self._draw_ai_debug,self._draw_cheats,self._draw_achievements,self._draw_easter_eggs,self._draw_export)
+                drawers[self.tab](top)
+                if self.confirm:
+                    c=self._font(12,True).render('Confirmation required: click the same destructive action again.',True,(255,190,90))
+                    self.screen.blit(c,(30,self.screen.get_height()-28))
+            now=time.time()
+            while self.tools.runtime_toasts and self.tools.runtime_toasts[0]['until'] < now:
+                self.tools.runtime_toasts.popleft()
+            if self.tools.runtime_toasts:
+                toast=self.tools.runtime_toasts[-1]
+                s=self._font(13,True).render(str(toast['message']),True,COLORS['white'])
+                rr=pygame.Rect(20,self.screen.get_height()-62,min(self.screen.get_width()-40,s.get_width()+24),34)
+                pygame.draw.rect(self.screen,(30,45,65),rr,border_radius=6); self.screen.blit(s,s.get_rect(center=rr.center))
+            pygame.display.flip()
+            panel_frame_ms = max(0.0, float(frame_dt))
+            panel_render_ms = max(0.0, (time.perf_counter() - frame_start) * 1000.0)
+            self.tools.telemetry.record_frame(panel_frame_ms, render_ms=min(panel_frame_ms, panel_render_ms), ui_ms=panel_render_ms)
+        return None
+
+
 class MainMenu:
     def __init__(self):
         # Load or create settings
@@ -28126,6 +30226,8 @@ class MainMenu:
         self.player_name = self.load_player_name()
         self.name_input_active = False
         self.current_language = self.settings.language
+        self._dev_unlock_buffer = []
+        self._dev_unlock_sequence = DEV_UNLOCK_SEQUENCE
         
         # Start/stop background music to match saved settings
         _apply_bgm_state(self.settings)
@@ -28137,6 +30239,7 @@ class MainMenu:
         # Create game objects
         self.game = SnakeGame(self.settings, self.screen)
         self.game.runtime = self.runtime
+        DEV_TOOLS.register_game(self.game)
         # Pass achievement manager to the game
         self.game.achievement_manager = self.achievement_manager
         self.highscores_screen = HighScoresScreen(self.settings, self.screen)
@@ -28423,6 +30526,34 @@ class MainMenu:
                 max(1, int(size))
             )
             
+    # ── DEV MODE -----------------------------------------------------------
+    def _unlock_dev_mode(self):
+        if DEV_TOOLS.state.unlock():
+            DEV_TOOLS.toast('DEV Mode unlocked')
+            self._init_ui()
+            self.ui.focus_key('dev')
+        return True
+
+    def _handle_dev_unlock_key(self, event):
+        if DEV_TOOLS.unlocked or event.type != pygame.KEYDOWN:
+            return False
+        if getattr(self.ui.focused, 'key', None) == 'name_input':
+            return False
+        self._dev_unlock_buffer.append(event.key)
+        if len(self._dev_unlock_buffer) > len(self._dev_unlock_sequence):
+            self._dev_unlock_buffer.pop(0)
+        if tuple(self._dev_unlock_buffer) == tuple(self._dev_unlock_sequence):
+            self._dev_unlock_buffer.clear()
+            self._unlock_dev_mode()
+            return True
+        return False
+
+    def _menu_open_dev(self):
+        DEV_TOOLS.open_panel(self.screen, self.game)
+        self.screen = pygame.display.get_surface() or self.screen
+        self.runtime.sync_surface(self.screen)
+        self._menu_sig = None
+
     # ── UI (layout-driven; see UI FOUNDATION section) ──────────────────────
     def _menu_entries(self):
         """Single source of truth for the menu: (key, text, colour, handler).
@@ -28434,15 +30565,22 @@ class MainMenu:
         Labels that are not in the translation tables yet keep their current
         literal via _t_or(); adding the key later localises them with no code change."""
         L = lambda: self.settings.language
-        return [
+        L = lambda: self.settings.language
+        entries = [
             ('play',        lambda: get_text(L(), 'play'),                             COLORS['green'],  self._menu_play),
             ('settings',    lambda: get_text(L(), 'settings'),                          COLORS['purple'], lambda: self._run_sub(self.settings_screen.run, name="settings", owner=self.settings_screen)),
             ('player_hub',  lambda: _t_or(L(), 'player_hub', 'Player Hub'),             COLORS['blue'],   lambda: self._run_sub(self.player_hub_screen.run, name="player_hub", owner=self.player_hub_screen)),
             ('studio',      lambda: _t_or(L(), 'studio', 'Studio'),                     (60, 130, 160),   lambda: self._run_sub(self.studio_screen.run, name="studio", owner=self.studio_screen)),
             ('mods',        lambda: _t_or(L(), 'mods', 'Mods'),                         (110, 90, 160),   lambda: self._run_sub(self.mods_screen.run, name="mods", owner=self.mods_screen)),
+        ]
+        if DEV_TOOLS.unlocked:
+            entries.append(('dev', lambda: 'DEV', (185, 50, 50), self._menu_open_dev))
+        entries.extend([
             ('credits',     lambda: _t_or(L(), 'credits', 'Credits'),                   COLORS['orange'], lambda: self._run_sub(self.show_credits, name="credits", owner=self)),
             ('exit',        lambda: get_text(L(), 'exit'),                              COLORS['red'],    self._menu_exit),
-        ]
+        ])
+        return entries
+
 
 
     def _init_ui(self):
@@ -28454,7 +30592,11 @@ class MainMenu:
         for key, text, color, handler in self._menu_entries():
             w[key] = UIButton(text, color=color, key=key, on_activate=handler)
         # The player-name field used to live here (spec: moved to MP\Player Hub\Profile)
-        self._menu_order = ['title', 'play', 'settings', 'player_hub', 'studio', 'mods', 'credits', 'exit']
+        self._menu_order = ['title', 'play', 'settings', 'player_hub', 'studio', 'mods']
+        if DEV_TOOLS.unlocked:
+            self._menu_order.append('dev')
+        self._menu_order += ['credits', 'exit']
+
         self._menu_sig = None
         self._menu_clock = pygame.time.Clock()
         self._dt = 1 / 60.0
@@ -28656,6 +30798,9 @@ class MainMenu:
             else:
                 self.transition_alpha = min(255, self.transition_alpha + self.transition_speed)
 
+        if DEV_TOOLS.unlocked and DEV_TOOLS.modified:
+            DEV_TOOLS.draw_dev_indicator(scr)
+
         # Draw achievement notifications (before the flip so they are actually visible)
         if getattr(self, 'achievement_manager', None):
             self.achievement_manager.draw_notification(scr, scr.get_width(), scr.get_height(), self.settings.language)
@@ -28708,13 +30853,8 @@ class MainMenu:
             claude_text = content_font.render("AI-assisted development by Claude (Anthropic)", True, COLORS['light_blue'])
             self.screen.blit(claude_text, (center_x - claude_text.get_width() // 2, content_y + line_spacing * 3))
             
-            # ChatGPT credit
-            chatgpt_text = render_fit(content_font, "AI-assisted development by ChatGPT (OpenAI)",
-                                      COLORS['light_blue'], int(screen_width * 0.96), padding=0)
-            self.screen.blit(chatgpt_text, (center_x - chatgpt_text.get_width() // 2, content_y + line_spacing * 4))
-            
             # Back button
-            back_button_y = content_y + line_spacing * 6
+            back_button_y = content_y + line_spacing * 5
             _btn_w = max(120, min(220, int(screen_width * 0.18)))
             _btn_h = max(36, min(56, int(screen_height * 0.075)))
             back_button = pygame.Rect(center_x - _btn_w // 2, back_button_y, _btn_w, _btn_h)
@@ -29086,6 +31226,13 @@ class MainMenu:
                     continue
                 if event.type == pygame.QUIT:
                     self._running = False
+
+                elif event.type == pygame.KEYDOWN and self._handle_dev_unlock_key(event):
+                    continue
+
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F8 and DEV_TOOLS.unlocked:
+                    self._menu_open_dev()
+                    continue
 
                 elif event.type == pygame.VIDEORESIZE:
                     self.screen = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
@@ -29568,7 +31715,36 @@ def run_startup_environment_check():
         dialog.resolve_issue(issue)
 
 
+def _run_dev_mode_selftest():
+    """Lightweight regression checks that do not enter the game loop."""
+    t = DevTelemetry()
+    t.activate()
+    t.record_frame(16.666, update_ms=1.0, render_ms=2.0, input_ms=0.2)
+    t.record_frame(33.333, update_ms=2.0, render_ms=4.0, input_ms=0.3)
+    summary = t.metric_summary('fps')
+    assert summary['count'] == 2 and summary['low_1'] is not None
+    t.deactivate()
+
+    state = DevStateManager()
+    before = bool(state.unlocked)
+    if not before:
+        state.unlocked = True
+        state.save()
+    assert state.unlocked
+    return {
+        'telemetry': 'PASS',
+        'persistent_unlock': 'PASS',
+        'cheat_catalog': len(DEV_CHEATS),
+        'toggle_catalog': len(DEV_TOGGLES),
+    }
+
+
 if __name__ == "__main__":
+    if os.environ.get('SGF_DEV_SELFTEST') == '1':
+        print('DEV_MODE_SELFTEST', _run_dev_mode_selftest())
+        pygame.quit()
+        sys.exit(0)
+
     if os.environ.get('SGF_IA5_SELFTEST') == '1':
         # Load translations first because constructors of some screens expect
         # the global translation table to be populated.
