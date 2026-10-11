@@ -499,6 +499,41 @@ def _map_theme_colors(settings):
     return MAP_THEME_PALETTES.get(theme, MAP_THEME_PALETTES['classic'])
 
 
+def _draw_map_theme_preview(surface, rect, settings):
+    """Miniature board drawn with the palette of settings.map_theme: the same
+    background/board/grid colours the real game uses, a short snake in the
+    player's colour and one fruit. Used live by the Map Themes screen."""
+    background, board, grid = _map_theme_colors(settings)
+    pygame.draw.rect(surface, background, rect, border_radius=10)
+    pygame.draw.rect(surface, (230, 235, 245), rect, 2, border_radius=10)
+    cells = 12
+    cell = max(6, min((rect.w - 24) // cells, (rect.h - 24) // cells))
+    board_rect = pygame.Rect(0, 0, cell * cells, cell * cells)
+    board_rect.center = rect.center
+    pygame.draw.rect(surface, board, board_rect)
+    for i in range(cells + 1):
+        pygame.draw.line(surface, grid, (board_rect.x + i * cell, board_rect.y),
+                         (board_rect.x + i * cell, board_rect.bottom))
+        pygame.draw.line(surface, grid, (board_rect.x, board_rect.y + i * cell),
+                         (board_rect.right, board_rect.y + i * cell))
+    snake_color = getattr(settings, 'snake_color', COLORS['snake'])
+    try:
+        head_color = tuple(min(255, int(c) + 60) for c in snake_color)
+    except Exception:
+        snake_color = head_color = COLORS['snake']
+    body = [(8, 6), (7, 6), (6, 6), (5, 6), (5, 7), (5, 8)]
+    for index, (cx, cy) in enumerate(body):
+        seg = pygame.Rect(board_rect.x + cx * cell + 1, board_rect.y + cy * cell + 1,
+                          cell - 2, cell - 2)
+        pygame.draw.rect(surface, head_color if index == 0 else snake_color,
+                         seg, border_radius=max(2, cell // 4))
+    fruit_rect = pygame.Rect(board_rect.x + 3 * cell, board_rect.y + 3 * cell, cell, cell)
+    try:
+        draw_fruit(surface, fruit_rect, 'regular')
+    except Exception:
+        pygame.draw.circle(surface, COLORS['red'], fruit_rect.center, max(2, cell // 2 - 1))
+
+
 _MOBILE_HAPTIC_BACKEND = None
 _MOBILE_HAPTIC_CHECKED = False
 
@@ -12057,7 +12092,11 @@ def get_text(language_code, key):
     lang_dict = TRANSLATIONS.get(language_code, TRANSLATIONS['en'])
     
     # Return the text for the key, or fallback to English
-    return lang_dict.get(key, TRANSLATIONS['en'].get(key, f"[Missing: {key}]"))
+    text = lang_dict.get(key, TRANSLATIONS['en'].get(key, f"[Missing: {key}]"))
+    if isinstance(text, str) and '\u2713' in text:
+        # Catalog strings use U+2713; draw whichever mark the fonts support.
+        text = text.replace('\u2713', safe_mark(language_code, 'check'))
+    return text
 
 
 # Local-profile labels use the same lookup path and catalog as the rest of UI.
@@ -12694,6 +12733,64 @@ def clear_font_cache():
     cached, since which system fonts are installed doesn't change at runtime)."""
     global font_cache
     font_cache = {}
+    _SAFE_MARK_CACHE.clear()
+
+
+# Symbols such as the check mark are not present in every UI font; when a
+# glyph is missing, pygame silently draws an empty "tofu" box. Instead of
+# hard-coding a character in each screen, every screen asks for the mark here
+# and gets the first candidate that the active fonts really draw.
+_SAFE_MARK_CACHE = {}
+_SAFE_MARK_CANDIDATES = {
+    'check': ('\u2713', '\u2714', '\u221a', '+'),
+    'lock': ('\U0001f512', '\u00d7', 'x'),
+}
+
+
+def _font_draws_glyph(font, char):
+    """True when `font` really draws `char` (not the missing-glyph box)."""
+    try:
+        metrics = font.metrics(char)
+        if not metrics or metrics[0] is None:
+            return False
+        glyph = font.render(char, True, (255, 255, 255))
+        if glyph.get_width() <= 0:
+            return False
+        # A font without the glyph draws its own ".notdef" box, which is
+        # identical to what a private-use code point produces.
+        missing = font.render('\uffff', True, (255, 255, 255))
+        if (glyph.get_size() == missing.get_size()
+                and pygame.image.tostring(glyph, 'RGBA')
+                == pygame.image.tostring(missing, 'RGBA')):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def safe_mark(language, kind='check'):
+    """Return a marker character ('check' or 'lock') that the UI fonts for
+    `language` can draw. Falls back to plain ASCII, never to a broken box."""
+    key = (language, kind)
+    cached = _SAFE_MARK_CACHE.get(key)
+    if cached is not None:
+        return cached
+    candidates = _SAFE_MARK_CANDIDATES.get(kind, ('+',))
+    chosen = candidates[-1]
+    try:
+        if not pygame.font.get_init():
+            # Fonts are not ready yet (startup/headless): answer with the
+            # ASCII fallback but do not cache it.
+            return chosen
+        fonts = [get_font(language, 'regular', 16), get_font(language, 'bold', 16)]
+        for char in candidates[:-1]:
+            if all(_font_draws_glyph(font, char) for font in fonts):
+                chosen = char
+                break
+    except Exception:
+        return chosen
+    _SAFE_MARK_CACHE[key] = chosen
+    return chosen
 
 ##############
 # ACHIEVEMENTS
@@ -15808,6 +15905,284 @@ def _prune_score_replays(highscores):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Replay storage tools (Settings > Data > Replays: Clean / Compress /
+# Organise / Delete). Pure functions over the replay directory so they can be
+# tested without the UI. They never touch a category other than replays, never
+# delete a replay that a high score still references, and every rewrite is
+# verified before the original is removed.
+# ---------------------------------------------------------------------------
+REPLAY_COMPRESSION_PROFILES = {'fast': 1, 'balanced': 6, 'maximum': 9}
+
+# Labels of the replay tools. Languages without an entry fall back to English
+# (see _replay_tool_label); the 32-language pass is tracked in TODO_LIST.md.
+_REPLAY_TOOL_LABELS = {
+    'en': {
+        'clean': 'Clean', 'compress': 'Compress', 'organize': 'Organize files',
+        'delete': 'Delete', 'profile': 'Compression', 'fast': 'Fast',
+        'balanced': 'Balanced', 'maximum': 'Maximum (slow)',
+        'confirm_delete': 'Delete {count} replay(s) ({size})? High scores keep their score but lose the replay.',
+        'confirm_clean': 'Remove {count} unneeded file(s) ({size})?',
+        'done_clean': 'Clean: {count} file(s) removed, {size} freed.',
+        'done_delete': 'Deleted {count} replay(s), {size} freed.',
+        'done_compress': 'Compressed {done} replay(s): {size} saved, {errors} error(s).',
+        'done_organize': 'Organized {done} replay(s): {size} saved, {errors} error(s).',
+        'working': 'Working... {done}/{total}',
+        'scope_all': 'No selection: applies to all replays.',
+        'scope_selected': '{count} selected.',
+        'estimate_note': '~ = estimate, the real value is shown afterwards.',
+    },
+    'pt_PT': {
+        'clean': 'Limpar', 'compress': 'Comprimir', 'organize': 'Organizar ficheiros',
+        'delete': 'Eliminar', 'profile': 'Compressão', 'fast': 'Rápida',
+        'balanced': 'Equilibrada', 'maximum': 'Máxima (lenta)',
+        'confirm_delete': 'Eliminar {count} replay(s) ({size})? Os recordes mantêm a pontuação mas perdem o replay.',
+        'confirm_clean': 'Remover {count} ficheiro(s) desnecessário(s) ({size})?',
+        'done_clean': 'Limpeza: {count} ficheiro(s) removido(s), {size} libertados.',
+        'done_delete': '{count} replay(s) eliminado(s), {size} libertados.',
+        'done_compress': '{done} replay(s) comprimido(s): {size} poupados, {errors} erro(s).',
+        'done_organize': '{done} replay(s) organizado(s): {size} poupados, {errors} erro(s).',
+        'working': 'A trabalhar... {done}/{total}',
+        'scope_all': 'Sem seleção: aplica-se a todos os replays.',
+        'scope_selected': '{count} selecionado(s).',
+        'estimate_note': '~ = estimativa; o valor real aparece depois.',
+    },
+    'pt_BR': {
+        'clean': 'Limpar', 'compress': 'Compactar', 'organize': 'Organizar arquivos',
+        'delete': 'Excluir', 'profile': 'Compactação', 'fast': 'Rápida',
+        'balanced': 'Equilibrada', 'maximum': 'Máxima (lenta)',
+        'confirm_delete': 'Excluir {count} replay(s) ({size})? Os recordes mantêm a pontuação mas perdem o replay.',
+        'confirm_clean': 'Remover {count} arquivo(s) desnecessário(s) ({size})?',
+        'done_clean': 'Limpeza: {count} arquivo(s) removido(s), {size} liberados.',
+        'done_delete': '{count} replay(s) excluído(s), {size} liberados.',
+        'done_compress': '{done} replay(s) compactado(s): {size} economizados, {errors} erro(s).',
+        'done_organize': '{done} replay(s) organizado(s): {size} economizados, {errors} erro(s).',
+        'working': 'Trabalhando... {done}/{total}',
+        'scope_all': 'Sem seleção: vale para todos os replays.',
+        'scope_selected': '{count} selecionado(s).',
+        'estimate_note': '~ = estimativa; o valor real aparece depois.',
+    },
+}
+
+
+def _replay_tool_label(language, key, **values):
+    table = _REPLAY_TOOL_LABELS.get(language) or _REPLAY_TOOL_LABELS['en']
+    text = table.get(key) or _REPLAY_TOOL_LABELS['en'].get(key, key)
+    try:
+        return text.format(**values) if values else text
+    except (KeyError, IndexError, ValueError):
+        return text
+
+
+def _replay_display_name(replay_id):
+    """'2026-10-08T15-18-21.725715_game' -> '08/10/2026 - 15:18:21.725715'."""
+    stamp = str(replay_id).split('_', 1)[0]
+    try:
+        day, clock = stamp.split('T', 1)
+        year, month, dom = day.split('-')
+        hh, mm, rest = clock.split('-', 2)
+        int(year), int(month), int(dom), int(hh), int(mm)
+        return f"{dom}/{month}/{year} - {hh}:{mm}:{rest}"
+    except (ValueError, AttributeError):
+        return str(replay_id)
+
+
+def replay_storage_scan(directory=None, referenced_ids=None):
+    """List replay files. `referenced_ids` is the set of replay ids that high
+    scores still point to, or None when that is unknown (then nothing is ever
+    reported as removable)."""
+    directory = directory or _user_data_manager.get_replay_dir()
+    entries, by_id, extras = [], {}, []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return {'replays': [], 'temp_files': [], 'duplicates': []}
+    for name in names:
+        full = os.path.join(directory, name)
+        if not os.path.isfile(full) or os.path.islink(full):
+            continue
+        if name.endswith('.tmp') or name.endswith('.part'):
+            extras.append({'path': full, 'size': os.path.getsize(full)})
+            continue
+        if not name.startswith('replay_'):
+            continue
+        if name.endswith('.json.gz'):
+            replay_id, compressed = name[len('replay_'):-len('.json.gz')], True
+        elif name.endswith('.json'):
+            replay_id, compressed = name[len('replay_'):-len('.json')], False
+        else:
+            continue
+        try:
+            stat = os.stat(full)
+        except OSError:
+            continue
+        entry = {'id': replay_id, 'path': full, 'size': stat.st_size,
+                 'mtime': stat.st_mtime, 'compressed': compressed,
+                 'name': _replay_display_name(replay_id),
+                 'referenced': (None if referenced_ids is None
+                                else replay_id in referenced_ids)}
+        if replay_id in by_id:
+            # Both replay_<id>.json and .json.gz exist: keep the compressed
+            # one as the replay, the plain copy is redundant.
+            first = by_id[replay_id]
+            keep, drop = (entry, first) if compressed else (first, entry)
+            by_id[replay_id] = keep
+            extras.append({'path': drop['path'], 'size': drop['size'], 'duplicate': True})
+        else:
+            by_id[replay_id] = entry
+    entries = sorted(by_id.values(), key=lambda e: e['name'])
+    return {'replays': entries,
+            'temp_files': [e for e in extras if not e.get('duplicate')],
+            'duplicates': [e for e in extras if e.get('duplicate')]}
+
+
+def replay_storage_referenced_ids():
+    """Replay ids still referenced by high scores, or None if unreadable."""
+    try:
+        data = _load_data()
+        scores = data.get('highscores', []) if isinstance(data, dict) else None
+        if not isinstance(scores, list):
+            return None
+        return {score.get('replay_id') for score in scores
+                if isinstance(score, dict) and score.get('replay_id')}
+    except Exception:
+        return None
+
+
+def replay_storage_clean_candidates(scan):
+    """Files Clean would remove: leftovers, redundant copies, orphaned replays."""
+    items = [dict(item, reason='temp') for item in scan['temp_files']]
+    items += [dict(item, reason='duplicate') for item in scan['duplicates']]
+    items += [dict(entry, reason='orphan') for entry in scan['replays']
+              if entry['referenced'] is False]
+    return items
+
+
+def replay_storage_estimate_clean(scan):
+    items = replay_storage_clean_candidates(scan)
+    return len(items), sum(item['size'] for item in items)
+
+
+def replay_storage_clean(scan):
+    """Delete the clean candidates. Returns (files_removed, bytes_freed)."""
+    removed = freed = 0
+    for item in replay_storage_clean_candidates(scan):
+        try:
+            os.remove(item['path'])
+            removed += 1
+            freed += item['size']
+        except OSError as exc:
+            _logging_mod.getLogger('sgf').warning('Clean could not remove %s: %s', item['path'], exc)
+    return removed, freed
+
+
+def replay_storage_delete(entries):
+    """Delete the chosen replays. High scores keep their entry; they simply
+    no longer have a replay (`_score_has_replay` checks the file)."""
+    removed = freed = 0
+    for entry in entries:
+        for path in (entry['path'], entry['path'][:-3] if entry['path'].endswith('.gz') else entry['path'] + '.gz'):
+            try:
+                size = os.path.getsize(path)
+                os.remove(path)
+                removed += 1
+                freed += size
+            except OSError:
+                pass
+    return removed, freed
+
+
+def _replay_read_payload(entry):
+    opener = (lambda: gzip.open(entry['path'], 'rt', encoding='utf-8')) if entry['compressed'] \
+        else (lambda: open(entry['path'], 'r', encoding='utf-8'))
+    with opener() as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or not isinstance(payload.get('events'), list):
+        raise ValueError('Replay failed validation')
+    return payload
+
+
+def replay_storage_rewrite(entry, level):
+    """Re-serialise one replay in compact form. level=None keeps it as plain
+    JSON, otherwise gzip at that level. The new file is verified by reading it
+    back; the original is only replaced/removed afterwards and only when the
+    result is not larger. Returns bytes saved (>= 0)."""
+    payload = _replay_read_payload(entry)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+    data = raw if level is None else gzip.compress(raw, compresslevel=level, mtime=0)
+    new_path = (entry['path'][:-3] if entry['path'].endswith('.gz') else entry['path']) \
+        + ('' if level is None else '.gz')
+    if len(data) >= entry['size'] and new_path == entry['path']:
+        return 0
+    if len(data) >= entry['size'] and level is not None and not entry['compressed']:
+        return 0
+    _atomic_write_bytes(new_path, data)
+    check_entry = dict(entry, path=new_path, compressed=level is not None)
+    if _replay_read_payload(check_entry) != payload:
+        try:
+            if new_path != entry['path']:
+                os.remove(new_path)
+        except OSError:
+            pass
+        raise ValueError('Rewritten replay differs from the original')
+    if new_path != entry['path']:
+        os.remove(entry['path'])
+    return max(0, entry['size'] - len(data))
+
+
+def replay_storage_estimate_compress(scan, profile='balanced', sample=4):
+    """Estimated bytes saved by Compress (a '~' value: measured on a sample of
+    the smallest files, then scaled to every replay)."""
+    level = REPLAY_COMPRESSION_PROFILES.get(profile, 6)
+    entries = [e for e in scan['replays'] if e['size'] > 0]
+    probe = sorted(entries, key=lambda e: e['size'])[:max(1, sample)]
+    before = after = 0
+    for entry in probe:
+        try:
+            payload = _replay_read_payload(entry)
+            raw = json.dumps(payload, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            before += entry['size']
+            after += min(entry['size'], len(gzip.compress(raw, compresslevel=level, mtime=0)))
+        except Exception:
+            continue
+    if before <= 0:
+        return 0
+    ratio = after / before
+    return int(sum(e['size'] for e in entries) * max(0.0, 1.0 - ratio))
+
+
+def replay_storage_compress(entries, profile='balanced', progress=None):
+    """Compress/recompress replays (also normalises their layout). Returns
+    {'saved': bytes, 'done': n, 'errors': n}. Safe to run in a worker."""
+    level = REPLAY_COMPRESSION_PROFILES.get(profile, 6)
+    result = {'saved': 0, 'done': 0, 'errors': 0}
+    for index, entry in enumerate(entries):
+        try:
+            result['saved'] += replay_storage_rewrite(entry, level)
+            result['done'] += 1
+        except Exception as exc:
+            result['errors'] += 1
+            _logging_mod.getLogger('sgf').warning('Replay compress failed for %s: %s', entry['id'], exc)
+        if progress:
+            progress(index + 1, len(entries))
+    return result
+
+
+def replay_storage_organize(entries, progress=None):
+    """Compact each replay's layout without changing its compression state."""
+    result = {'saved': 0, 'done': 0, 'errors': 0}
+    for index, entry in enumerate(entries):
+        try:
+            result['saved'] += replay_storage_rewrite(entry, 6 if entry['compressed'] else None)
+            result['done'] += 1
+        except Exception as exc:
+            result['errors'] += 1
+            _logging_mod.getLogger('sgf').warning('Replay organise failed for %s: %s', entry['id'], exc)
+        if progress:
+            progress(index + 1, len(entries))
+    return result
+
+
 def _migrate_embedded_content(data):
     """Move legacy embedded replays and user maps to their own files.
 
@@ -18420,7 +18795,7 @@ class SettingsScreen:
         
         # Track current settings page (0: General, 1: Colors, 2: Powerups, 3: Fruits, 4: Gameplay, 5: Sound, 6: Data)
         self.current_page = 0  # Default to General settings page
-        self.page_names = ["general", "colors", "powerups", "fruits", "gameplay", "sound", "accessibility", "controls", "data"]
+        self.page_names = ["general", "powerups", "fruits", "gameplay", "sound", "accessibility", "controls", "data"]
 
         # IA3: Settings > Data — pending confirmation for a destructive
         # data-management action (delete category / reset settings /
@@ -18429,6 +18804,14 @@ class SettingsScreen:
         self.data_scroll_offset = 0
         self.data_scroll_max = 0
         self.storage_selected_category = None
+        # Data explorer: expandable categories and the replay tools state.
+        self.data_expanded = set()
+        self.data_replay_selection = set()
+        self.data_replay_scan_cache = None      # (monotonic time, scan)
+        self.data_replay_estimates = {}
+        self.data_replay_profile = 'balanced'
+        self.data_replay_job = None
+        self.data_replay_message = ''
         self.capture_control_action = None
         self.capture_control_error = False
 
@@ -18683,6 +19066,15 @@ class SettingsScreen:
             get_text(self.settings.language, 'wall_collision')
         )
 
+        # Snake colour (the former "Colors" tab) lives in the free column to the
+        # right of the inputs, so it needs no page of its own.
+        color_x = margin_x + content_width + max(24, int(screen_width * 0.04))
+        color_w = screen_width - color_x - margin_x
+        controls['color_options'] = self.draw_color_grid(
+            pygame.Rect(color_x, language_y + 30, color_w, 0),  # below the speed hint line
+            self.temp_settings.snake_color,
+            get_text(self.settings.language, 'snake_color'))
+
         # Show language options LAST so they render on top of everything below
         if language_dropdown_open:
             controls['language_options'], controls['language_scrollbar'], self.language_scroll_offset = self.show_dropdown_options(
@@ -18699,8 +19091,42 @@ class SettingsScreen:
         # Return the updated controls
         return controls
         
+    def draw_color_grid(self, area, current_color, label):
+        """Snake colour swatches in a wrapping grid with a live preview below.
+        `area` gives x, y and the available width; returns [(rect, color)]."""
+        lang = self.settings.language
+        if area.w < 60:
+            return []
+        label_surface = render_fit(get_font(lang, 'regular', 20), label,
+                                   COLORS['white'], area.w, padding=0)
+        self.screen.blit(label_surface, (area.x, area.y - 30))
+        gap = 6
+        size = max(22, min(34, (area.w - 5 * gap) // 6))
+        columns = max(1, (area.w + gap) // (size + gap))
+        rects = []
+        for index, (_name, color) in enumerate(COLOR_OPTIONS.items()):
+            row, col = divmod(index, columns)
+            rect = pygame.Rect(area.x + col * (size + gap),
+                               area.y + row * (size + gap), size, size)
+            pygame.draw.rect(self.screen, color, rect, border_radius=5)
+            if tuple(current_color) == tuple(color):
+                pygame.draw.rect(self.screen, COLORS['white'], rect, width=3, border_radius=5)
+            rects.append((rect, color))
+        rows = (len(COLOR_OPTIONS) + columns - 1) // columns
+        preview_y = area.y + rows * (size + gap) + 10
+        body_color = tuple(current_color)
+        head_color = tuple(min(255, int(c) + 60) for c in body_color)
+        seg = max(16, size - 6)
+        for i in range(5):
+            seg_rect = pygame.Rect(area.x + i * (seg + 3), preview_y, seg, seg)
+            if seg_rect.right > area.right:
+                break
+            pygame.draw.rect(self.screen, head_color if i == 0 else body_color,
+                             seg_rect, border_radius=5)
+        return rects
+
     def draw_colors_settings(self, screen_width, screen_height, margin_x, content_width, start_y, spacing, controls):
-        """Draw the colors settings page"""
+        """Legacy colors page (no longer a tab; kept for compatibility)."""
         # Snake color picker
         snake_color_y = start_y
         snake_color_rect = pygame.Rect(margin_x, snake_color_y, content_width, int(screen_height * 0.05))
@@ -19049,6 +19475,244 @@ class SettingsScreen:
         self.screen.blit(hint, (margin_x, row_y + 4))
         return controls
 
+    def _draw_replay_block(self, block, offset, viewport_top, viewport_bottom,
+                           label_font, path_font, controls):
+        """Children rows + the replay-only action bar (Clean / Compress /
+        Organize / Delete). Estimates are marked with '~'."""
+        lang = self.settings.language
+        scan = block['scan']
+        checks = controls.setdefault('_data_replay_checks', [])
+        selected_ids = self.data_replay_selection
+        for rect, entry in block['children']:
+            rect = rect.move(0, -offset)
+            if rect.bottom < viewport_top or rect.top > viewport_bottom:
+                continue  # only draw/click what is visible
+            chosen = entry['id'] in selected_ids
+            pygame.draw.rect(self.screen, (62, 68, 92) if chosen else (46, 50, 70), rect, border_radius=5)
+            box = pygame.Rect(rect.x + 6, rect.centery - 7, 14, 14)
+            pygame.draw.rect(self.screen, COLORS['white'], box, 2, border_radius=3)
+            if chosen:
+                pygame.draw.rect(self.screen, COLORS['light_blue'], box.inflate(-6, -6), border_radius=2)
+            suffix = ' · gz' if entry['compressed'] else ''
+            name = f"Replay {entry['name']}"
+            size_text = f"{_format_bytes(entry['size'])}{suffix}"
+            size_surf = render_fit(path_font, size_text, COLORS['light_gray'], max(40, rect.width // 3), padding=0)
+            name_surf = render_fit(path_font, name, COLORS['white'],
+                                   rect.width - size_surf.get_width() - 40, padding=0)
+            self.screen.blit(name_surf, (rect.x + 28, rect.centery - name_surf.get_height() // 2))
+            self.screen.blit(size_surf, (rect.right - size_surf.get_width() - 8,
+                                         rect.centery - size_surf.get_height() // 2))
+            checks.append((rect, entry['id']))
+
+        busy = self.data_replay_job is not None
+        targets = self._data_replay_targets(scan)
+        profile = self.data_replay_profile
+        est_key = (profile, tuple(sorted(e['id'] for e in targets)))
+        if est_key not in self.data_replay_estimates:
+            self.data_replay_estimates[est_key] = replay_storage_estimate_compress(
+                dict(scan, replays=targets), profile)
+        clean_count, clean_bytes = replay_storage_estimate_clean(scan)
+        chosen_entries = [e for e in scan['replays'] if e['id'] in selected_ids]
+        delete_bytes = sum(e['size'] for e in chosen_entries)
+        specs = {
+            'clean': (f"{_replay_tool_label(lang, 'clean')} +~{_format_bytes(clean_bytes)}",
+                      clean_count > 0, COLORS['blue']),
+            'compress': (f"{_replay_tool_label(lang, 'compress')} +~{_format_bytes(self.data_replay_estimates[est_key])}",
+                         bool(targets), COLORS['green']),
+            'organize': (_replay_tool_label(lang, 'organize'), bool(targets), COLORS['button']),
+            'delete': (f"{_replay_tool_label(lang, 'delete')} +~{_format_bytes(delete_bytes)}",
+                       bool(chosen_entries), COLORS['red']),
+        }
+        actions = controls.setdefault('_data_replay_actions', {})
+        for key, rect in block['buttons'].items():
+            rect = rect.move(0, -offset)
+            label, enabled, color = specs[key]
+            enabled = enabled and not busy
+            self.create_button(rect, label, color if enabled else COLORS['dark_gray'])
+            if enabled and rect.bottom > viewport_top and rect.top < viewport_bottom:
+                actions[key] = rect
+        prect = block['profile'].move(0, -offset)
+        self.create_button(prect, f"{_replay_tool_label(lang, 'profile')}: {_replay_tool_label(lang, profile)}",
+                           COLORS['button'])
+        if prect.bottom > viewport_top and prect.top < viewport_bottom:
+            actions['profile'] = prect
+        srect = block['status'].move(0, -offset)
+        job = self.data_replay_job
+        if job is not None:
+            pygame.draw.rect(self.screen, COLORS['dark_gray'], srect, border_radius=5)
+            fraction = job['done'] / max(1, job['total'])
+            fill = pygame.Rect(srect.x, srect.y, int(srect.width * fraction), srect.height)
+            pygame.draw.rect(self.screen, COLORS['light_blue'], fill, border_radius=5)
+            text = _replay_tool_label(lang, 'working', done=job['done'], total=job['total'])
+        else:
+            text = self.data_replay_message or (
+                _replay_tool_label(lang, 'scope_selected', count=len(chosen_entries)) if chosen_entries
+                else _replay_tool_label(lang, 'scope_all'))
+        status = render_fit(path_font, text, COLORS['white'], srect.width - 8, padding=0)
+        self.screen.blit(status, (srect.x + 4, srect.centery - status.get_height() // 2))
+
+    def _data_replay_scan(self, force=False):
+        """Replay directory scan, cached for a couple of seconds."""
+        cached = self.data_replay_scan_cache
+        now = time.monotonic()
+        if not force and cached and now - cached[0] < 2.0:
+            return cached[1]
+        scan = replay_storage_scan(referenced_ids=replay_storage_referenced_ids())
+        self.data_replay_scan_cache = (now, scan)
+        self.data_replay_estimates = {}
+        return scan
+
+    def _data_replay_targets(self, scan):
+        chosen = [e for e in scan['replays'] if e['id'] in self.data_replay_selection]
+        return chosen or list(scan['replays'])
+
+    def _data_replay_invalidate(self):
+        self.data_replay_scan_cache = None
+        self.data_replay_estimates = {}
+        self.data_replay_selection &= {
+            e['id'] for e in (self._data_replay_scan(force=True)['replays'])}
+
+    def _data_replay_start_job(self, kind):
+        """Run compress/organize in a worker thread. The worker only touches
+        replay files and a plain progress dict, never pygame."""
+        if self.data_replay_job is not None:
+            return
+        scan = self._data_replay_scan()
+        entries = self._data_replay_targets(scan)
+        if not entries:
+            return
+        profile = self.data_replay_profile
+        job = {'kind': kind, 'done': 0, 'total': len(entries), 'result': None}
+
+        def progress(done, total):
+            job['done'], job['total'] = done, total
+
+        def work():
+            try:
+                if kind == 'compress':
+                    job['result'] = replay_storage_compress(entries, profile, progress)
+                else:
+                    job['result'] = replay_storage_organize(entries, progress)
+            except Exception as exc:
+                _logging_mod.getLogger('sgf').warning('Replay %s job failed: %s', kind, exc)
+                job['result'] = {'saved': 0, 'done': 0, 'errors': len(entries)}
+
+        self.data_replay_job = job
+        threading.Thread(target=work, name=f'replay-{kind}', daemon=True).start()
+
+    def _handle_replay_click(self, controls, pos):
+        """Clicks on the replay rows and the replay-only action bar."""
+        lang = self.settings.language
+        for rect, replay_id in controls.get('_data_replay_checks', []):
+            if rect.collidepoint(pos):
+                self.data_replay_selection ^= {replay_id}
+                self.data_replay_message = ''
+                return True
+        actions = controls.get('_data_replay_actions', {})
+        for key, rect in actions.items():
+            if not rect.collidepoint(pos):
+                continue
+            scan = self._data_replay_scan()
+            self.data_replay_message = ''
+            if key == 'profile':
+                order = list(REPLAY_COMPRESSION_PROFILES)
+                self.data_replay_profile = order[(order.index(self.data_replay_profile) + 1) % len(order)]
+            elif key in ('compress', 'organize'):
+                self._data_replay_start_job(key)
+            elif key == 'clean':
+                count, size = replay_storage_estimate_clean(scan)
+                self.confirm_data_action = {
+                    'kind': 'replay_clean', 'scan': scan,
+                    'message_lines': [_replay_tool_label(
+                        lang, 'confirm_clean', count=count, size=_format_bytes(size))]}
+            elif key == 'delete':
+                chosen = [e for e in scan['replays'] if e['id'] in self.data_replay_selection]
+                self.confirm_data_action = {
+                    'kind': 'replay_delete', 'entries': chosen,
+                    'message_lines': [_replay_tool_label(
+                        lang, 'confirm_delete', count=len(chosen),
+                        size=_format_bytes(sum(e['size'] for e in chosen)))]}
+            return True
+        return False
+
+    def _data_replay_poll_job(self):
+        job = self.data_replay_job
+        if job is None or job['result'] is None:
+            return
+        lang = self.settings.language
+        result = job['result']
+        self.data_replay_message = _replay_tool_label(
+            lang, 'done_compress' if job['kind'] == 'compress' else 'done_organize',
+            done=result['done'], size=_format_bytes(result['saved']), errors=result['errors'])
+        self.data_replay_job = None
+        self._data_replay_invalidate()
+
+    def _draw_storage_cylinder(self, area, groups, total, selected_key, font):
+        """Vertical cylinder of stacked discs (one per storage category) with a
+        clickable legend. Cheap 2D shapes only: rects and ellipses.
+        Returns (segments, legend) as lists of (rect, key, label, size, color)."""
+        screen = self.screen
+        cw = max(40, min(96, int(area.w * 0.4)))
+        eh = max(10, int(cw * 0.3))
+        top, height = area.y, max(eh * 3, area.h)
+        body_top = top + eh // 2
+        body_bottom = top + height - eh // 2
+        body_h = max(1, body_bottom - body_top)
+        cx = area.x
+        shell = (46, 52, 72)
+        pygame.draw.ellipse(screen, shell, (cx, body_bottom - eh // 2, cw, eh))
+        pygame.draw.rect(screen, shell, (cx, body_top, cw, body_h))
+        pygame.draw.ellipse(screen, (64, 72, 98), (cx, top, cw, eh))
+        shown = [g for g in groups if int(g[2] or 0) > 0]
+        segments = []
+        if total > 0 and shown:
+            heights = [max(3, int(round(body_h * int(g[2]) / total))) for g in shown]
+            while sum(heights) > body_h and max(heights) > 3:
+                heights[heights.index(max(heights))] -= 1
+            y = body_bottom
+            for index, ((key, label, size, color), h) in enumerate(zip(shown, heights)):
+                seg_top = max(body_top, y - h)
+                dark = tuple(max(0, int(c * 0.78)) for c in color)
+                light = tuple(min(255, int(c * 1.18) + 12) for c in color)
+                if index == 0:
+                    pygame.draw.ellipse(screen, dark, (cx, y - eh // 2, cw, eh))
+                pygame.draw.rect(screen, color, (cx, seg_top, cw, y - seg_top))
+                pygame.draw.ellipse(screen, light, (cx, seg_top - eh // 2, cw, eh))
+                seg_rect = pygame.Rect(cx, seg_top - eh // 2, cw, (y - seg_top) + eh)
+                seg_rect = seg_rect.clip(screen.get_rect())
+                if key == selected_key:
+                    pygame.draw.rect(screen, COLORS['white'], seg_rect, 2, border_radius=4)
+                segments.append((seg_rect, key, label, int(size), color))
+                y = seg_top
+            # Soft vertical highlight and shade give the cylinder its volume.
+            # Only the straight body is shaded, so the elliptical top and
+            # bottom keep clean curved edges.
+            shade = pygame.Surface((cw, body_h), pygame.SRCALPHA)
+            pygame.draw.rect(shade, (255, 255, 255, 38), (int(cw * 0.12), 0, max(3, int(cw * 0.14)), shade.get_height()))
+            pygame.draw.rect(shade, (0, 0, 0, 52), (int(cw * 0.78), 0, cw - int(cw * 0.78), shade.get_height()))
+            screen.blit(shade, (cx, body_top))
+
+        legend = []
+        lx = cx + cw + 18
+        lw = area.right - lx
+        row_h = max(font.get_height() + 6, 20)
+        if lw > 50:
+            ly = top
+            for key, label, size, color in shown:
+                row = pygame.Rect(lx, ly, lw, row_h)
+                if row.bottom > top + height:
+                    break
+                if key == selected_key:
+                    pygame.draw.rect(screen, (50, 60, 90), row, border_radius=4)
+                pygame.draw.rect(screen, color, (row.x + 4, row.centery - 5, 10, 10), border_radius=2)
+                text = render_fit(font, f"{label}  {_format_bytes(size)}",
+                                  COLORS['white'] if key == selected_key else COLORS['light_gray'],
+                                  max(10, lw - 22), padding=0)
+                screen.blit(text, (row.x + 20, row.centery - text.get_height() // 2))
+                legend.append((row, key, label, int(size), color))
+                ly += row_h + 2
+        return segments, legend
+
     def draw_data_settings(self, screen_width, screen_height, margin_x, content_width, start_y, spacing, controls):
         """IA3: Settings > Data — the SGF Data folder page. Shows where data
         lives, lets the player open the folder, delete individual
@@ -19064,7 +19728,10 @@ class SettingsScreen:
         path_label = _t_or(lang, 'data_folder_location', 'SGF Data folder:')
         path_surface = render_fit(path_font, f"{path_label} {_user_data_manager.get_data_dir()}",
                                    COLORS['light_gray'], screen_width - 2 * margin_x)
-        self.screen.blit(path_surface, (margin_x, start_y + int(spacing * 0.32)))
+        # Stack the lines from the real font heights; fixed fractions of
+        # `spacing` made the title and the path line overlap in small windows.
+        path_y = start_y + title.get_height() + 4
+        self.screen.blit(path_surface, (margin_x, path_y))
 
         row_h = max(42, min(54, int(screen_height * 0.09)))
         row_gap = max(5, int(row_h * 0.12))
@@ -19087,7 +19754,7 @@ class SettingsScreen:
             category_rows.append((cat_key, get_text(lang, label_key),
                                   _user_data_manager.get_category_stats(cat_key)))
 
-        summary_y = start_y + int(spacing * 0.57)
+        summary_y = path_y + path_surface.get_height() + 6
         category_bytes = sum(stats['size_bytes'] for _key, _label, stats in category_rows)
         category_files = sum(stats['file_count'] for _key, _label, stats in category_rows)
         root_stats = _user_data_manager.get_total_stats()
@@ -19099,12 +19766,17 @@ class SettingsScreen:
         summary_font = get_font(lang, 'regular', max(11, min(14, int(spacing * 0.22))))
         summary = f"{get_text(lang, 'storage_sgf_data')}: {_format_bytes(sgf_data_bytes)}"
         summary_surface = render_fit(summary_font, summary, COLORS['white'], content_width, padding=0)
-        self.screen.blit(summary_surface, (margin_x, summary_y))
+        # The total is already shown below the bar (also when a segment is
+        # selected), so it is not repeated above it.
 
         # A compact rounded cylinder with category-colored slices. The bright
         # rim and soft lower edge suggest volume without expensive 3D effects.
-        bar_y = summary_y + summary_font.get_height() + 6
-        bar_h = max(15, min(22, int(spacing * 0.34)))
+        bar_y = summary_y
+        cyl_x = margin_x + content_width + max(36, int(screen_width * 0.05))
+        cyl_area = pygame.Rect(cyl_x, start_y + 4, screen_width - cyl_x - margin_x,
+                               int(screen_height * 0.62))
+        use_cylinder = cyl_area.w >= 140 and cyl_area.h >= 120
+        bar_h = 0 if use_cylinder else max(15, min(22, int(spacing * 0.34)))
         bar_rect = pygame.Rect(margin_x, bar_y, content_width, bar_h)
         pygame.draw.rect(self.screen, COLORS['dark_gray'], bar_rect, border_radius=bar_h // 2)
         visual_groups = [
@@ -19142,10 +19814,17 @@ class SettingsScreen:
                 controls['_storage_segments'].append(
                     (segment, group_key, label, size_bytes, color))
                 cursor_x += segment_w
-        pygame.draw.line(self.screen, (235, 240, 250),
-                         (bar_rect.x + bar_h // 2, bar_rect.y + 2),
-                         (max(bar_rect.x + bar_h // 2, bar_rect.right - bar_h // 2),
-                          bar_rect.y + 2), 1)
+        if bar_h:
+            pygame.draw.line(self.screen, (235, 240, 250),
+                             (bar_rect.x + bar_h // 2, bar_rect.y + 2),
+                             (max(bar_rect.x + bar_h // 2, bar_rect.right - bar_h // 2),
+                              bar_rect.y + 2), 1)
+        controls['_storage_legend'] = []
+        if use_cylinder:
+            controls['_storage_segments'], controls['_storage_legend'] = (
+                self._draw_storage_cylinder(
+                    cyl_area, visual_groups, group_total,
+                    self.storage_selected_category, summary_font))
         selected = next((item for item in visual_groups
                          if item[0] == self.storage_selected_category), None)
         if selected:
@@ -19160,17 +19839,46 @@ class SettingsScreen:
         viewport_top = row_y
         viewport_bottom = screen_height - max(12, int(screen_height * 0.03))
         controls['_data_rows'] = []
+        for _stale_key in ('_data_arrows', '_data_replay_checks', '_data_replay_actions'):
+            controls.pop(_stale_key, None)
         controls['_data_storage_summary'] = {
             'size_bytes': sgf_data_bytes,
             'file_count': sgf_file_count,
         }
         del_btn_w = max(80, int(content_width * 0.18))
         row_rects = []
+        replay_block = None
+        self._data_replay_poll_job()
         for (cat_key, label, cat_stats) in category_rows:
             size_bytes = cat_stats['size_bytes']
             row_rect = pygame.Rect(margin_x, row_y, content_width, row_h)
             row_rects.append((row_rect, cat_key, label, cat_stats, del_btn_w))
             row_y += row_h + row_gap
+            if cat_key == 'replays' and 'replays' in self.data_expanded:
+                # Expanded replay list plus the actions that only act on it.
+                scan = self._data_replay_scan()
+                child_h = max(24, int(row_h * 0.55))
+                children = []
+                for entry in scan['replays']:
+                    children.append((pygame.Rect(margin_x + 18, row_y, content_width - 18, child_h), entry))
+                    row_y += child_h + 2
+                btn_h = max(32, int(row_h * 0.72))
+                half_w = (content_width - 18 - 6) // 2
+                grid_x = margin_x + 18
+                row_y += 4
+                buttons = {
+                    'clean': pygame.Rect(grid_x, row_y, half_w, btn_h),
+                    'compress': pygame.Rect(grid_x + half_w + 6, row_y, half_w, btn_h),
+                    'organize': pygame.Rect(grid_x, row_y + btn_h + 6, half_w, btn_h),
+                    'delete': pygame.Rect(grid_x + half_w + 6, row_y + btn_h + 6, half_w, btn_h),
+                }
+                row_y += 2 * btn_h + 6 + 6
+                profile_rect = pygame.Rect(grid_x, row_y, content_width - 18, max(26, int(btn_h * 0.8)))
+                row_y += profile_rect.height + 4
+                status_rect = pygame.Rect(grid_x, row_y, content_width - 18, max(20, int(btn_h * 0.6)))
+                row_y += status_rect.height + row_gap + 4
+                replay_block = {'children': children, 'buttons': buttons,
+                                'profile': profile_rect, 'status': status_rect, 'scan': scan}
 
         action_btn_h = max(36, int(row_h * 0.9))
         open_y = row_y
@@ -19188,18 +19896,33 @@ class SettingsScreen:
             row_rect.y -= offset
             size_bytes = cat_stats['size_bytes']
             pygame.draw.rect(self.screen, COLORS['dark_gray'], row_rect, border_radius=6)
-            text = render_fit(label_font, f"{label} — {_format_bytes(size_bytes)}", COLORS['white'], row_rect.width - del_btn_w - 28, padding=0)
-            self.screen.blit(text, (row_rect.x + 12, row_rect.y + 3))
+            text = render_fit(label_font, f"{label} — {_format_bytes(size_bytes)}", COLORS['white'], row_rect.width - del_btn_w - 50, padding=0)
+            self.screen.blit(text, (row_rect.x + 34, row_rect.y + 3))
+            if cat_key == 'replays':
+                # Expand arrow, drawn as a polygon (no font glyph needed).
+                arrow = pygame.Rect(row_rect.x + 4, row_rect.y, 26, row_rect.height)
+                cx, cy = arrow.center
+                if cat_key in self.data_expanded:
+                    points = [(cx - 6, cy - 3), (cx + 6, cy - 3), (cx, cy + 5)]
+                else:
+                    points = [(cx - 3, cy - 6), (cx - 3, cy + 6), (cx + 5, cy)]
+                pygame.draw.polygon(self.screen, COLORS['white'], points)
+                if row_rect.bottom > viewport_top and row_rect.top < viewport_bottom:
+                    controls.setdefault('_data_arrows', []).append((arrow, cat_key))
             modified = (datetime.fromtimestamp(cat_stats['last_modified']).strftime('%Y-%m-%d')
                         if cat_stats['last_modified'] is not None else '—')
             details = get_text(lang, 'data_files_updated').format(
                 count=cat_stats['file_count'], date=modified)
             detail_surf = render_fit(path_font, details, COLORS['light_gray'],
-                                     row_rect.width - del_btn_w - 28, padding=0)
-            self.screen.blit(detail_surf, (row_rect.x + 12, row_rect.bottom - detail_surf.get_height() - 3))
+                                     row_rect.width - del_btn_w - 50, padding=0)
+            self.screen.blit(detail_surf, (row_rect.x + 34, row_rect.bottom - detail_surf.get_height() - 3))
             del_rect = pygame.Rect(row_rect.right - del_btn_w - 8, row_rect.y + 4, del_btn_w, row_rect.height - 8)
             self.create_button(del_rect, _t_or(lang, 'delete', 'Delete'), COLORS['red'])
             controls['_data_rows'].append((del_rect, cat_key, label, cat_stats))
+
+        if replay_block is not None:
+            self._draw_replay_block(replay_block, offset, viewport_top, viewport_bottom,
+                                    label_font, path_font, controls)
 
         open_rect = pygame.Rect(margin_x, open_y - offset, content_width, action_btn_h)
         self.create_button(open_rect, _t_or(lang, 'open_data_folder', 'Open SGF Data Folder'), COLORS['blue'])
@@ -19292,6 +20015,19 @@ class SettingsScreen:
         if kind == 'delete_category':
             result, _error = delete_category(action['category'])
             return bool(result)
+        elif kind == 'replay_clean':
+            count, freed = replay_storage_clean(action['scan'])
+            self.data_replay_message = _replay_tool_label(
+                self.settings.language, 'done_clean', count=count, size=_format_bytes(freed))
+            self._data_replay_invalidate()
+            return True
+        elif kind == 'replay_delete':
+            count, freed = replay_storage_delete(action['entries'])
+            self.data_replay_message = _replay_tool_label(
+                self.settings.language, 'done_delete', count=count, size=_format_bytes(freed))
+            self.data_replay_selection.clear()
+            self._data_replay_invalidate()
+            return True
         elif kind == 'reset_settings':
             # Clears only the persisted `settings` section — saves, high
             # scores, achievements, and encyclopedia progress are untouched.
@@ -19634,17 +20370,18 @@ class SettingsScreen:
         )
         
         # Determine which page to show based on current_page
-        if self.current_page == 0:  # General settings page
+        # Pages are chosen by name, not by position, so adding or removing a
+        # tab can never shift which drawer a tab opens.
+        _page_name = self.page_names[self.current_page]
+        if _page_name == 'general':
             self.draw_general_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls, language_dropdown_open)
-        elif self.current_page == 1:  # Colors page
-            self.draw_colors_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls)
-        elif self.current_page == 2:  # Powerups page
+        elif _page_name == 'powerups':
             self.draw_powerups_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls)
-        elif self.current_page == 3:  # Fruits page
+        elif _page_name == 'fruits':
             self.draw_fruits_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls)
-        elif self.current_page == 4:  # Gameplay page
+        elif _page_name == 'gameplay':
             self.draw_gameplay_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls)
-        elif self.current_page == 5:  # Sound page
+        elif _page_name == 'sound':
             self.draw_sound_settings(screen_width, screen_height, margin_x, content_width, item_start_y, item_spacing, controls)
         elif self.page_names[self.current_page] == 'accessibility':
             self.draw_accessibility_settings(screen_width, margin_x, content_width, item_start_y, item_spacing, controls)
@@ -19846,13 +20583,31 @@ class SettingsScreen:
                             running = False
                             continue
                         storage_segment_selected = False
-                        for segment_rect, group_key, _label, _size, _color in controls.get(
-                                '_storage_segments', []):
+                        for segment_rect, group_key, _label, _size, _color in (
+                                list(controls.get('_storage_segments', []))
+                                + list(controls.get('_storage_legend', []))):
                             if segment_rect.collidepoint(mouse_pos):
                                 self.storage_selected_category = group_key
                                 storage_segment_selected = True
                                 break
                         if storage_segment_selected:
+                            continue
+                        for arrow_rect, arrow_key in controls.get('_data_arrows', []):
+                            if arrow_rect.collidepoint(mouse_pos):
+                                if arrow_key in self.data_expanded:
+                                    self.data_expanded.discard(arrow_key)
+                                    self.data_replay_selection.clear()
+                                else:
+                                    self.data_expanded.add(arrow_key)
+                                    self.data_replay_scan_cache = None
+                                self.data_replay_message = ''
+                                break
+                        else:
+                            arrow_rect = None
+                        if arrow_rect is not None:
+                            continue
+                        replay_click = self._handle_replay_click(controls, mouse_pos)
+                        if replay_click:
                             continue
                         for del_rect, cat_key, label, cat_stats in controls.get('_data_rows', []):
                             if del_rect.collidepoint(mouse_pos):
@@ -23465,7 +24220,7 @@ class HighScoresScreen:
 
                 name_text = str(score.get('name', '') or '')
                 if score.get('victory', False):
-                    name_text += ' \u2713'
+                    name_text += ' ' + safe_mark(self.settings.language, 'check')
 
                 speed_display = f"{score.get('update_rate_ms', 200)}ms"
                 row_data = [
@@ -38900,7 +39655,22 @@ class _SimpleMenuScreen:
         self.body_fn = body_fn
         self.runtime = None  # set by whoever opens this, like every other sub-screen
         self.current_language = settings.language
+        # Optional live preview: a subclass sets preview_draw(surface, rect)
+        # and the menu then takes the left part of the window while the
+        # preview fills the right part (see _preview_split()).
+        if not hasattr(self, 'preview_draw'):
+            self.preview_draw = None
         self._init_ui()
+
+    def _preview_split(self):
+        """(menu_width, preview_rect or None) for the current window size."""
+        sw, sh = self.screen.get_size()
+        if self.preview_draw is None or sw < 520:
+            return sw, None
+        menu_w = int(sw * 0.52)
+        margin = max(12, int(sw * 0.03))
+        rect = pygame.Rect(menu_w, margin, sw - menu_w - margin, sh - 2 * margin)
+        return menu_w, rect
 
     def _init_ui(self):
         self.ui = UIManager(lambda: self.screen.get_rect(), self.settings.language)
@@ -38943,6 +39713,7 @@ class _SimpleMenuScreen:
     def _build(self):
         ui, view, W = self.ui, self.view, self._widgets
         sw, sh = self.screen.get_size()
+        sw, _preview_rect = self._preview_split()  # menu column width
         lang = self.settings.language
         ui.language = lang
         view.set_rect(pygame.Rect(0, 0, sw, sh))
@@ -39001,6 +39772,12 @@ class _SimpleMenuScreen:
         self.ui.language = self.settings.language
         self.ui.update(self._dt)
         self.ui.draw(scr)
+        _menu_w, preview_rect = self._preview_split()
+        if preview_rect is not None and self.preview_draw is not None:
+            try:
+                self.preview_draw(scr, preview_rect)
+            except Exception as exc:
+                sgf_log.warning('Preview draw failed: %s', type(exc).__name__)
         pygame.display.flip()
         render_ms = (time.perf_counter() - frame_start) * 1000.0
         DEV_TOOLS.telemetry.record_frame(
@@ -39051,7 +39828,8 @@ class ThemeEditorScreen(_SimpleMenuScreen):
             entries.append((
                 f'theme_{theme_id}',
                 lambda name=theme_name, tid=theme_id:
-                    f"✓ {name}" if self.preview_theme_id == tid else name,
+                    f"{safe_mark(self.settings.language, 'check')} {name}"
+                    if self.preview_theme_id == tid else name,
                 COLORS['blue'],
                 lambda tid=theme_id: self._preview_theme(tid),
             ))
@@ -39112,7 +39890,8 @@ class CosmeticSelectionScreen(_SimpleMenuScreen):
 
     def __init__(self, settings, screen, *, title_fn, options, initial_value,
                  preview_fn, commit_fn, selected_key, extra_status_fn=None,
-                 can_select_fn=None):
+                 can_select_fn=None, preview_draw=None):
+        self.preview_draw = preview_draw
         self.original_value = initial_value
         self.preview_value = initial_value
         self.preview_fn = preview_fn
@@ -39129,7 +39908,8 @@ class CosmeticSelectionScreen(_SimpleMenuScreen):
             def label(value=value, label_fn=label_fn):
                 name = label_fn()
                 if self.preview_value == value:
-                    return f"✓ {name} · {get_text(self.settings.language, self.selected_key)}"
+                    return (f"{safe_mark(self.settings.language, 'check')} {name} · "
+                            f"{get_text(self.settings.language, self.selected_key)}")
                 return name
             entries.append((
                 f'appearance_{value}', label, color,
@@ -39177,6 +39957,545 @@ class CosmeticSelectionScreen(_SimpleMenuScreen):
             self.preview_fn(self.original_value)
             self.preview_value = self.original_value
         super()._go_back()
+
+
+# ---------------------------------------------------------------------------
+# Update check. Looks at the project's GitHub repository in a background
+# thread and, if a newer version exists, lets the player open the download
+# page. It never downloads or runs anything by itself: replacing a running
+# script or executable needs a verified checksum first (planned, see TODO).
+# ---------------------------------------------------------------------------
+GAME_UPDATE_REPO = 'Dell2635/SnakeGame'
+_UPDATE_CHECK_INTERVAL_SECONDS = 0          # checked at every launch
+_UPDATE_MODES = ('auto', 'ask', 'off')
+_UPDATE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+_UPDATE_MAX_EXE_BYTES = 250 * 1024 * 1024
+_UPDATE_SOURCE_FILES = ('SGF.py', 'SGF')   # the file is still named "SGF" in the repo
+_UPDATE_RANGE_BYTES = 196608
+_UPDATE_VERSION_RE = re.compile(r'(?m)^GAME_VERSION\s*=\s*["\'](\d+(?:\.\d+){1,3})["\']')
+
+_UPDATE_LABELS = {
+    'en': {
+        'title': 'Updates', 'checking': 'Checking for updates...',
+        'up_to_date': 'You have the latest version ({local}).',
+        'error': 'Could not check for updates. You may be offline; try again later.',
+        'available': 'Version {version} is available (you have {local}).',
+        'notes': 'What is new:', 'no_install': 'The game never installs updates by itself; the button below opens the download page.',
+        'disabled': 'Update checks are turned off.',
+        'open': 'Open download page', 'skip': 'Skip this version',
+        'stop': 'Stop checking for updates', 'resume': 'Check for updates automatically',
+        'menu_entry': 'Check for updates',
+        'installed': 'Version {version} was installed. Restart the game to use it.',
+        'staged': 'Version {version} was downloaded and will replace the game when it restarts.',
+        'install_error': 'The update could not be installed automatically ({reason}). You can download it manually.',
+        'restart': 'Restart now', 'install': 'Install now',
+        'mode_auto': 'Updates: install automatically', 'mode_ask': 'Updates: ask me first', 'mode_off': 'Updates: off',
+        'reason_dev': 'this is a development copy', 'reason_launcher': 'the game runs from the launcher',
+        'reason_readonly': 'the game folder is read-only', 'reason_unsupported': 'not supported on this system',
+        'reason_checksum': 'the download could not be verified', 'reason_download': 'the download failed',
+    },
+    'pt_PT': {
+        'title': 'Atualizações', 'checking': 'A procurar atualizações...',
+        'up_to_date': 'Tens a versão mais recente ({local}).',
+        'error': 'Não foi possível procurar atualizações. Podes estar sem ligação; tenta mais tarde.',
+        'available': 'A versão {version} está disponível (tens a {local}).',
+        'notes': 'Novidades:', 'no_install': 'O jogo nunca se atualiza sozinho; o botão abaixo abre a página de transferência.',
+        'disabled': 'A procura de atualizações está desligada.',
+        'open': 'Abrir página de transferência', 'skip': 'Ignorar esta versão',
+        'stop': 'Parar de procurar atualizações', 'resume': 'Procurar atualizações automaticamente',
+        'menu_entry': 'Procurar atualizações',
+        'installed': 'A versão {version} foi instalada. Reinicia o jogo para a usar.',
+        'staged': 'A versão {version} foi descarregada e substitui o jogo quando reiniciar.',
+        'install_error': 'Não foi possível instalar a atualização automaticamente ({reason}). Podes descarregá-la à mão.',
+        'restart': 'Reiniciar agora', 'install': 'Instalar agora',
+        'mode_auto': 'Atualizações: instalar automaticamente', 'mode_ask': 'Atualizações: perguntar primeiro', 'mode_off': 'Atualizações: desligadas',
+        'reason_dev': 'esta é uma cópia de desenvolvimento', 'reason_launcher': 'o jogo corre a partir do launcher',
+        'reason_readonly': 'a pasta do jogo é só de leitura', 'reason_unsupported': 'não é suportado neste sistema',
+        'reason_checksum': 'não foi possível verificar a transferência', 'reason_download': 'a transferência falhou',
+    },
+    'pt_BR': {
+        'title': 'Atualizações', 'checking': 'Procurando atualizações...',
+        'up_to_date': 'Você tem a versão mais recente ({local}).',
+        'error': 'Não foi possível procurar atualizações. Você pode estar sem conexão; tente mais tarde.',
+        'available': 'A versão {version} está disponível (você tem a {local}).',
+        'notes': 'Novidades:', 'no_install': 'O jogo nunca se atualiza sozinho; o botão abaixo abre a página de download.',
+        'disabled': 'A busca de atualizações está desligada.',
+        'open': 'Abrir página de download', 'skip': 'Ignorar esta versão',
+        'stop': 'Parar de procurar atualizações', 'resume': 'Procurar atualizações automaticamente',
+        'menu_entry': 'Procurar atualizações',
+        'installed': 'A versão {version} foi instalada. Reinicie o jogo para usá-la.',
+        'staged': 'A versão {version} foi baixada e substitui o jogo quando reiniciar.',
+        'install_error': 'Não foi possível instalar a atualização automaticamente ({reason}). Você pode baixá-la manualmente.',
+        'restart': 'Reiniciar agora', 'install': 'Instalar agora',
+        'mode_auto': 'Atualizações: instalar automaticamente', 'mode_ask': 'Atualizações: perguntar primeiro', 'mode_off': 'Atualizações: desligadas',
+        'reason_dev': 'esta é uma cópia de desenvolvimento', 'reason_launcher': 'o jogo roda a partir do launcher',
+        'reason_readonly': 'a pasta do jogo é somente leitura', 'reason_unsupported': 'não há suporte neste sistema',
+        'reason_checksum': 'não foi possível verificar o download', 'reason_download': 'o download falhou',
+    },
+}
+
+
+def _update_label(language, key, **values):
+    table = _UPDATE_LABELS.get(language) or _UPDATE_LABELS['en']
+    text = table.get(key) or _UPDATE_LABELS['en'].get(key, key)
+    try:
+        return text.format(**values) if values else text
+    except (KeyError, IndexError, ValueError):
+        return text
+
+
+def _update_version_tuple(text):
+    """'v1.2.3' / '1.2' -> (1, 2, 3) / (1, 2, 0); None when not a version."""
+    match = re.fullmatch(r'[vV]?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?', str(text or '').strip())
+    if not match:
+        return None
+    parts = [int(part) if part is not None else 0 for part in match.groups()]
+    return tuple(parts)
+
+
+def _update_is_newer(remote, local):
+    remote_t, local_t = _update_version_tuple(remote), _update_version_tuple(local)
+    return bool(remote_t and local_t and remote_t > local_t)
+
+
+def _update_state_path():
+    return os.path.join(_user_data_manager.get_config_dir(), 'update_state.json')
+
+
+def _load_update_state():
+    state = {'enabled': True, 'mode': 'auto', 'last_check': 0.0, 'skipped_version': ''}
+    try:
+        with open(_update_state_path(), 'r', encoding='utf-8') as handle:
+            stored = json.load(handle)
+        if isinstance(stored, dict):
+            mode = stored.get('mode')
+            if mode not in _UPDATE_MODES:
+                mode = 'auto' if stored.get('enabled', True) else 'off'
+            state['mode'] = mode
+            state['enabled'] = mode != 'off'
+            state['last_check'] = float(stored.get('last_check') or 0.0)
+            skipped = stored.get('skipped_version')
+            state['skipped_version'] = skipped if isinstance(skipped, str) else ''
+    except (OSError, ValueError, TypeError):
+        pass
+    return state
+
+
+def _save_update_state(state):
+    try:
+        mode = state.get('mode') if state.get('mode') in _UPDATE_MODES else (
+            'auto' if state.get('enabled', True) else 'off')
+        _atomic_write_json(_update_state_path(), {
+            'version': 2, 'mode': mode, 'enabled': mode != 'off',
+            'last_check': float(state.get('last_check') or 0.0),
+            'skipped_version': str(state.get('skipped_version') or '')})
+        return True
+    except Exception as exc:
+        _logging_mod.getLogger('sgf').warning('Could not save update state: %s', exc)
+        return False
+
+
+def _update_check_due(state, now=None):
+    now = time.time() if now is None else now
+    return bool(state.get('enabled', True)) and (
+        now - float(state.get('last_check') or 0.0) >= _UPDATE_CHECK_INTERVAL_SECONDS)
+
+
+def _update_http_get(url, headers, limit):
+    """(status, body) for an https GET, reading at most `limit` bytes."""
+    import urllib.request as _urlrequest
+    import urllib.error as _urlerror
+    if not url.startswith('https://'):
+        raise ValueError('Only https URLs are allowed')
+    request = _urlrequest.Request(url, headers=dict(headers, **{'User-Agent': 'SGF update check'}))
+    try:
+        with _urlrequest.urlopen(request, timeout=6.0) as response:
+            return response.status, response.read(limit + 1)
+    except _urlerror.HTTPError as exc:
+        return exc.code, b''
+
+
+def _update_release_candidate(body, frozen):
+    release = json.loads(body.decode('utf-8'))
+    if not isinstance(release, dict) or release.get('draft') or release.get('prerelease'):
+        return None
+    tag = str(release.get('tag_name') or '')
+    if _update_version_tuple(tag) is None:
+        return None
+    page = str(release.get('html_url') or '')
+    if not page.startswith(f'https://github.com/{GAME_UPDATE_REPO}/'):
+        page = f'https://github.com/{GAME_UPDATE_REPO}/releases'
+    asset, asset_url, sums_url = '', '', ''
+    prefix = f'https://github.com/{GAME_UPDATE_REPO}/releases/download/'
+    if frozen:
+        for item in release.get('assets') or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get('name') or '')
+            link = str(item.get('browser_download_url') or '')
+            if not link.startswith(prefix):
+                continue
+            if name.lower().endswith('.exe') and not asset:
+                asset, asset_url = name, link
+            elif name.lower() in ('sha256sums', 'sha256sums.txt', 'sha256sum.txt'):
+                sums_url = link
+    return {'version': tag.lstrip('vV'), 'source': 'release', 'url': page,
+            'notes': str(release.get('body') or '').strip()[:600], 'asset': asset,
+            'asset_url': asset_url, 'sums_url': sums_url}
+
+
+def fetch_update_info(local_version=None, fetch=None, frozen=None):
+    """Compare this game with the newest release (and, when running from
+    source, with GAME_VERSION in the repository). Returns a dict with
+    status 'available' | 'up_to_date' | 'error'. `fetch` is injectable."""
+    local = local_version or GAME_VERSION
+    fetch = fetch or _update_http_get
+    frozen = bool(getattr(sys, 'frozen', False)) if frozen is None else frozen
+    candidates, attempts, errors = [], 0, 0
+    attempts += 1
+    try:
+        status, body = fetch(
+            f'https://api.github.com/repos/{GAME_UPDATE_REPO}/releases/latest',
+            {'Accept': 'application/vnd.github+json'}, 400000)
+        if status == 200:
+            candidate = _update_release_candidate(body, frozen)
+            if candidate:
+                candidates.append(candidate)
+        elif status != 404:      # 404 simply means "no release published yet"
+            errors += 1
+    except Exception:
+        errors += 1
+    if not frozen:
+        attempts += 1
+        found = False
+        for name in _UPDATE_SOURCE_FILES:
+            try:
+                status, body = fetch(
+                    f'https://raw.githubusercontent.com/{GAME_UPDATE_REPO}/main/{name}',
+                    {'Range': f'bytes=0-{_UPDATE_RANGE_BYTES - 1}'}, _UPDATE_RANGE_BYTES)
+            except Exception:
+                continue
+            if status in (200, 206):
+                match = _UPDATE_VERSION_RE.search(body.decode('utf-8', 'replace'))
+                if match:
+                    candidates.append({
+                        'version': match.group(1), 'source': 'source',
+                        'url': f'https://github.com/{GAME_UPDATE_REPO}', 'notes': '', 'asset': '',
+                        'file': name})
+                    found = True
+                    break
+        if not found:
+            errors += 1
+    if not candidates:
+        return {'status': 'error' if errors >= attempts else 'up_to_date', 'local': local}
+    best = max(candidates, key=lambda c: (_update_version_tuple(c['version']), c['source'] == 'release'))
+    result = dict(best, local=local)
+    result['status'] = 'available' if _update_is_newer(best['version'], local) else 'up_to_date'
+    return result
+
+
+def _update_target_script():
+    """Path of the running script when it can be replaced, else None."""
+    if getattr(sys, 'frozen', False):
+        return None
+    try:
+        return os.path.abspath(__file__)
+    except NameError:
+        return None
+
+
+def _update_install_blocker(frozen=None, script_path=None):
+    """Why the game must not replace itself here (a reason key) or None."""
+    frozen = bool(getattr(sys, 'frozen', False)) if frozen is None else frozen
+    if frozen:
+        return None if sys.platform == 'win32' else 'unsupported'
+    path = script_path or _update_target_script()
+    if not path:
+        return 'unsupported'
+    folder = os.path.dirname(path)
+    if '_snake_game_runtime' in path.replace('\\', '/').split('/'):
+        return 'launcher'          # a launcher re-extracts its own copy
+    if os.path.isdir(os.path.join(folder, '.git')):
+        return 'dev'               # never overwrite a development checkout
+    if not os.access(folder, os.W_OK):
+        return 'readonly'
+    return None
+
+
+def update_install_source(info, script_path, fetch=None):
+    """Download the new script, verify it and replace `script_path`.
+    Verified: https from the project's repository only, size limit, valid UTF-8
+    and Python syntax, and the downloaded file must itself declare a version
+    newer than the running one. The old script is kept as <name>.<old version>.bak.
+    Returns (ok, reason_key)."""
+    fetch = fetch or _update_http_get
+    name = info.get('file') or os.path.basename(script_path)
+    if name not in _UPDATE_SOURCE_FILES:
+        return False, 'download'
+    new_path = script_path + '.new'
+    try:
+        status, body = fetch(
+            f'https://raw.githubusercontent.com/{GAME_UPDATE_REPO}/main/{name}', {}, _UPDATE_MAX_SOURCE_BYTES)
+        if status != 200 or not body or len(body) > _UPDATE_MAX_SOURCE_BYTES:
+            return False, 'download'
+        text = body.decode('utf-8')
+        match = _UPDATE_VERSION_RE.search(text)
+        if not match or not _update_is_newer(match.group(1), info.get('local') or GAME_VERSION):
+            return False, 'checksum'
+        compile(text, 'SGF_update', 'exec')
+        if 'GAME_VERSION' not in text or '__main__' not in text:
+            return False, 'checksum'
+        with open(new_path, 'wb') as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        backup = f"{script_path}.{info.get('local') or GAME_VERSION}.bak"
+        _shutil_mod.copy2(script_path, backup)
+        os.replace(new_path, script_path)
+        return True, ''
+    except (SyntaxError, UnicodeDecodeError, ValueError):
+        return False, 'checksum'
+    except OSError as exc:
+        _logging_mod.getLogger('sgf').warning('Update install failed: %s', exc)
+        return False, 'readonly'
+    except Exception as exc:
+        _logging_mod.getLogger('sgf').warning('Update install failed: %s', type(exc).__name__)
+        return False, 'download'
+    finally:
+        try:
+            if os.path.exists(new_path):
+                os.remove(new_path)
+        except OSError:
+            pass
+
+
+def update_stage_release(info, exe_path, fetch=None):
+    """Download the release .exe and verify its SHA-256 against the release's
+    SHA256SUMS file. Without that file nothing is installed. The verified file
+    is stored as <exe>.new and swapped in by update_restart_into_new()."""
+    fetch = fetch or _update_http_get
+    if not (info.get('asset_url') and info.get('sums_url')):
+        return False, 'checksum'
+    new_path = exe_path + '.new'
+    try:
+        status, sums = fetch(info['sums_url'], {}, 1024 * 1024)
+        if status != 200:
+            return False, 'checksum'
+        expected = ''
+        for line in sums.decode('utf-8', 'replace').splitlines():
+            parts = line.replace('*', ' ').split()
+            if len(parts) >= 2 and parts[-1] == info['asset']:
+                expected = parts[0].lower()
+        if not re.fullmatch(r'[0-9a-f]{64}', expected):
+            return False, 'checksum'
+        status, body = fetch(info['asset_url'], {}, _UPDATE_MAX_EXE_BYTES)
+        if status != 200 or not body or len(body) > _UPDATE_MAX_EXE_BYTES:
+            return False, 'download'
+        if hashlib.sha256(body).hexdigest() != expected:
+            return False, 'checksum'
+        with open(new_path, 'wb') as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return True, ''
+    except OSError:
+        return False, 'readonly'
+    except Exception as exc:
+        _logging_mod.getLogger('sgf').warning('Update download failed: %s', type(exc).__name__)
+        return False, 'download'
+
+
+def update_restart():
+    """Start the game again and leave this process (called after the UI has
+    closed pygame). Source install: relaunch the script. Windows exe: a small
+    batch file swaps <exe>.new in once this process has exited, then starts it."""
+    if getattr(sys, 'frozen', False):
+        exe = sys.executable
+        if not os.path.exists(exe + '.new'):
+            subprocess.Popen([exe])
+            return
+        bat = os.path.join(tempfile.gettempdir(), f'sgf_update_{os.getpid()}.bat')
+        with open(bat, 'w', encoding='utf-8') as handle:
+            handle.write(
+                '@echo off\r\n'
+                'for /L %%i in (1,1,60) do (\r\n'
+                f'  move /Y "{exe}" "{exe}.old" >nul 2>&1 && goto swapped\r\n'
+                '  timeout /t 1 /nobreak >nul\r\n'
+                ')\r\n'
+                'goto done\r\n'
+                ':swapped\r\n'
+                f'move /Y "{exe}.new" "{exe}" >nul 2>&1\r\n'
+                ':done\r\n'
+                f'start "" "{exe}"\r\n'
+                'del "%~f0"\r\n')
+        subprocess.Popen(['cmd', '/c', bat], creationflags=0x00000008 | 0x08000000, close_fds=True)
+    else:
+        subprocess.Popen([sys.executable] + sys.argv)
+
+
+class UpdateChecker:
+    """Runs fetch_update_info (and, in 'auto' mode, the install) on a worker
+    thread; the UI only reads `result`."""
+
+    def __init__(self, fetch=None):
+        self.fetch = fetch
+        self.result = None
+        self.checking = False
+        self.prompted = False
+        self.installing = False
+        self.restart_requested = False
+
+    def install(self, info=None):
+        """Install the update described by `info`; fills result['installed'],
+        result['staged'] or result['install_error'] (a reason key)."""
+        info = info or self.result
+        if not info or info.get('status') != 'available':
+            return False
+        blocker = _update_install_blocker()
+        if blocker:
+            info['install_error'] = blocker
+            return False
+        self.installing = True
+        try:
+            if getattr(sys, 'frozen', False):
+                ok, reason = update_stage_release(info, sys.executable, self.fetch)
+                key = 'staged'
+            else:
+                ok, reason = update_install_source(info, _update_target_script(), self.fetch)
+                key = 'installed'
+            if ok:
+                info[key] = True
+                info.pop('install_error', None)
+            else:
+                info['install_error'] = reason
+            return ok
+        finally:
+            self.installing = False
+
+    def start(self, force=False):
+        if os.environ.get('SGF_NO_UPDATE_CHECK') == '1' or self.checking:
+            return False
+        state = _load_update_state()
+        if not force and not _update_check_due(state):
+            return False
+        self.checking, self.result = True, None
+
+        def work():
+            info = {'status': 'error', 'local': GAME_VERSION}
+            try:
+                info = fetch_update_info(fetch=self.fetch)
+            except Exception as exc:
+                _logging_mod.getLogger('sgf').warning('Update check failed: %s', type(exc).__name__)
+            if info.get('status') != 'error':
+                latest = _load_update_state()
+                latest['last_check'] = time.time()
+                _save_update_state(latest)
+            if info.get('status') == 'available' and _load_update_state().get('mode') == 'auto':
+                try:
+                    self.install(info)
+                except Exception as exc:
+                    info['install_error'] = 'download'
+                    _logging_mod.getLogger('sgf').warning('Auto update failed: %s', type(exc).__name__)
+            self.result = info
+            self.checking = False
+
+        threading.Thread(target=work, name='update-check', daemon=True).start()
+        return True
+
+
+class UpdateAvailableScreen(_SimpleMenuScreen):
+    """Shows the update state (checking / up to date / installed / available /
+    offline) and the actions that make sense for it."""
+
+    def __init__(self, settings, screen, checker):
+        self.checker = checker
+        lang = lambda: settings.language
+        entries = [
+            ('update_primary', self._primary_label, COLORS['green'], self._primary),
+            ('update_open', lambda: _update_label(lang(), 'open'), COLORS['blue'], self._open_page),
+            ('update_skip', lambda: _update_label(lang(), 'skip'), COLORS['button'], self._skip),
+            ('update_mode', self._mode_label, COLORS['button'], self._cycle_mode),
+        ]
+        super().__init__(settings, screen,
+                         title_fn=lambda: _update_label(lang(), 'title'),
+                         entries=entries, body_fn=self._body)
+
+    def _info(self):
+        return self.checker.result
+
+    def _done(self, info):
+        return bool(info and (info.get('installed') or info.get('staged')))
+
+    def _body(self):
+        lang = self.settings.language
+        mode = _load_update_state().get('mode', 'auto')
+        info = self._info()
+        if mode == 'off' and info is None:
+            return _update_label(lang, 'disabled')
+        if self.checker.checking or self.checker.installing or info is None:
+            return _update_label(lang, 'checking')
+        if info['status'] == 'error':
+            return _update_label(lang, 'error')
+        if info['status'] == 'up_to_date':
+            return _update_label(lang, 'up_to_date', local=info['local'])
+        if info.get('installed'):
+            return _update_label(lang, 'installed', version=info['version'])
+        if info.get('staged'):
+            return _update_label(lang, 'staged', version=info['version'])
+        text = _update_label(lang, 'available', version=info['version'], local=info['local'])
+        if info.get('notes'):
+            text += '\n\n' + _update_label(lang, 'notes') + '\n' + info['notes'][:300]
+        if info.get('install_error'):
+            reason = _update_label(lang, 'reason_' + str(info['install_error']))
+            text += '\n\n' + _update_label(lang, 'install_error', reason=reason)
+        return text
+
+    def _primary_label(self):
+        lang = self.settings.language
+        info = self._info()
+        if self._done(info):
+            return _update_label(lang, 'restart')
+        if info and info.get('status') == 'available' and not info.get('install_error'):
+            return _update_label(lang, 'install')
+        return _update_label(lang, 'open')
+
+    def _primary(self):
+        info = self._info()
+        if self._done(info):
+            self.checker.restart_requested = True
+            self._running = False
+        elif (info and info.get('status') == 'available' and not info.get('install_error')
+                and not self.checker.installing):
+            # Download and verify off the UI thread; the body shows progress.
+            threading.Thread(target=self.checker.install, args=(info,),
+                             name='update-install', daemon=True).start()
+        else:
+            self._open_page()
+
+    def _mode_label(self):
+        return _update_label(self.settings.language, 'mode_' + _load_update_state().get('mode', 'auto'))
+
+    def _open_page(self):
+        info = self._info()
+        if info and info.get('status') == 'available' and str(info.get('url', '')).startswith('https://github.com/'):
+            try:
+                webbrowser.open(info['url'])
+            except Exception as exc:
+                _logging_mod.getLogger('sgf').warning('Could not open the download page: %s', exc)
+
+    def _skip(self):
+        info = self._info()
+        if info and info.get('status') == 'available':
+            state = _load_update_state()
+            state['skipped_version'] = info['version']
+            _save_update_state(state)
+            self._running = False
+
+    def _cycle_mode(self):
+        state = _load_update_state()
+        current = state.get('mode', 'auto')
+        state['mode'] = _UPDATE_MODES[(_UPDATE_MODES.index(current) + 1) % len(_UPDATE_MODES)]
+        _save_update_state(state)
 
 
 class ProfileScreen(_SimpleMenuScreen):
@@ -41814,7 +43133,9 @@ class DevPanelScreen:
         y = actions[-1][2].y + 50
         for a in list(mgr.achievements.values())[:12]:
             col=(110,220,130) if a.unlocked else (145,150,165)
-            prefix='✓ ' if a.unlocked else '🔒 '
+            _mark_lang = getattr(getattr(self, 'settings', None), 'language', 'en')
+            prefix = (safe_mark(_mark_lang, 'check') if a.unlocked
+                      else safe_mark(_mark_lang, 'lock')) + ' '
             self.screen.blit(self._font(13).render(prefix+a.name,col),(38,y)); y+=19
             if a.unlocked or not getattr(a,'secret',False):
                 desc=str(getattr(a,'description','') or '')
@@ -42100,7 +43421,12 @@ class DevPanelScreen:
         frame_h = self._workspace_frame_height()
         frame_rect = pygame.Rect(rect.x, rect.y, rect.w,
                                  frame_h if self._workspace_minimized else rect.h)
-        pygame.draw.rect(display, (18, 23, 39), frame_rect, border_radius=7)
+        # Only the title bar is filled here. This runs AFTER the content has
+        # been blitted, so filling the whole frame would paint over it and the
+        # window would look empty; the body background is filled before the
+        # content in _draw_workspace().
+        title_bar = pygame.Rect(rect.x, rect.y, rect.w, frame_h)
+        pygame.draw.rect(display, (18, 23, 39), title_bar, border_radius=7)
         pygame.draw.rect(display, (100, 125, 165), frame_rect, 2, border_radius=7)
         title = render_fit(self._font(15, True), 'DEV Workspace',
                            (245, 95, 95), max(40, rect.w - 230), padding=4)
@@ -42144,6 +43470,11 @@ class DevPanelScreen:
         display.blit(self._workspace_shade, (0, 0))
         target, self._workspace_scale = self._workspace_content_target()
         self._workspace_content_rect = target
+        if not self._workspace_minimized:
+            body = self._workspace_rect.copy()
+            body.y += self._workspace_frame_height()
+            body.h = max(0, body.h - self._workspace_frame_height())
+            pygame.draw.rect(display, (18, 23, 39), body, border_radius=7)
         if target.w and target.h:
             scaled = pygame.transform.scale(self._workspace_canvas, target.size)
             display.blit(scaled, target.topleft)
@@ -43022,10 +44353,9 @@ class MainMenu:
         ]
         if DEV_TOOLS.unlocked:
             entries.append(('dev', lambda: 'DEV', (185, 50, 50), self._menu_open_dev))
-        entries.extend([
-            ('credits',     lambda: _t_or(L(), 'credits', 'Credits'),                   COLORS['orange'], lambda: self._run_sub(self.show_credits, name="credits", owner=self)),
-            ('exit',        lambda: get_text(L(), 'exit'),                              COLORS['red'],    self._menu_exit),
-        ])
+        # Credits live only in the Info Center (see _ph_open_info_center).
+        entries.append(
+            ('exit',        lambda: get_text(L(), 'exit'),                              COLORS['red'],    self._menu_exit))
         return entries
 
 
@@ -43042,7 +44372,7 @@ class MainMenu:
         self._menu_order = ['title', 'play', 'settings', 'player_hub', 'studio', 'mods', 'info']
         if DEV_TOOLS.unlocked:
             self._menu_order.append('dev')
-        self._menu_order += ['credits', 'exit']
+        self._menu_order += ['exit']
 
         self._menu_sig = None
         self._menu_clock = pygame.time.Clock()
@@ -43148,6 +44478,34 @@ class MainMenu:
             entries=[], body_fn=lambda: content)
         self._run_sub(viewer.run, name=f'info_{title_key}', owner=viewer)
 
+    def _update_prompt_tick(self):
+        """Offer a found update once per session, from the main menu only."""
+        checker = getattr(self, '_update_checker', None)
+        if checker is None or checker.prompted or checker.result is None:
+            return
+        checker.prompted = True
+        info = checker.result
+        if (info.get('status') == 'available'
+                and (info.get('installed') or info.get('staged')
+                     or info.get('version') != _load_update_state().get('skipped_version'))):
+            screen = UpdateAvailableScreen(self.settings, self.screen, checker)
+            self._run_sub(screen.run, name='update_available', owner=screen)
+            self._update_maybe_restart()
+
+    def _update_maybe_restart(self):
+        checker = getattr(self, '_update_checker', None)
+        if checker is not None and checker.restart_requested:
+            self._restart_after_exit = True
+            self._running = False
+
+    def _ph_check_updates_now(self):
+        checker = getattr(self, '_update_checker', None) or UpdateChecker()
+        self._update_checker = checker
+        checker.start(force=True)
+        screen = UpdateAvailableScreen(self.settings, self.screen, checker)
+        self._run_sub(screen.run, name='update_check', owner=screen)
+        self._update_maybe_restart()
+
     def _ph_open_info_center(self):
         L = lambda: self.settings.language
         summary = get_text(L(), 'info_summary').format(
@@ -43188,6 +44546,7 @@ class MainMenu:
 
         entries = [
             ('info_tutorial', lambda: get_text(L(), 'show_tutorial'), COLORS['green'], self.show_tutorial),
+            ('info_updates', lambda: _update_label(L(), 'menu_entry'), COLORS['blue'], self._ph_check_updates_now),
             ('info_license', lambda: get_text(L(), 'info_license'), COLORS['blue'], open_license),
             ('info_third_party', lambda: get_text(L(), 'info_third_party'), COLORS['purple'], open_third_party),
             ('info_data', lambda: _t_or(L(), 'settings_tab_data', 'Data'), (70, 135, 150), open_data_settings),
@@ -43244,7 +44603,9 @@ class MainMenu:
             entries = []
             for profile in profiles:
                 profile_id = profile['id']
-                profile_label = profile['name'] + (' ✓' if profile['active'] else '')
+                profile_label = profile['name'] + (
+                    ' ' + safe_mark(self.current_language, 'check')
+                    if profile['active'] else '')
                 def label(profile_label=profile_label):
                     return profile_label
                 def activate(profile_id=profile_id):
@@ -43311,12 +44672,15 @@ class MainMenu:
                     self.settings.language, key, theme.title()),
                 MAP_THEME_PALETTES[theme][2],
             ))
+        def draw_preview(surface, rect):
+            _draw_map_theme_preview(surface, rect, self.settings)
+
         screen = CosmeticSelectionScreen(
             self.settings, self.screen,
             title_fn=lambda: _t_or(self.settings.language, 'map_themes', 'Map Themes'),
             options=options, initial_value=original_theme,
             preview_fn=preview_theme, commit_fn=save_theme,
-            selected_key='map_theme_selected')
+            selected_key='map_theme_selected', preview_draw=draw_preview)
         self._run_sub(screen.run, name='map_themes', owner=screen)
 
     def _ph_open_stats(self):
@@ -44279,10 +45643,14 @@ class MainMenu:
                 break
 
         self._running = True
+        # Background update check (at most once a day, can be turned off).
+        self._update_checker = UpdateChecker()
+        self._update_checker.start()
 
         while self._running:
             self._dt = self._menu_clock.tick(60) / 1000.0
             self.draw_menu()
+            self._update_prompt_tick()
             # Initialize the achievement manager in case it doesn't exist yet
             if not hasattr(self, 'achievement_manager'):
                 self.achievement_manager = AchievementManager()
@@ -46558,6 +47926,122 @@ def _run_ia5_integration_selftest():
         except OSError:
             pass
 
+    # Replay storage tools: clean never removes referenced replays (or anything
+    # when references are unknown), compress verifies, delete is exact.
+    import tempfile as _tempfile
+    with _tempfile.TemporaryDirectory() as _rt_dir:
+        def _rt_make(index, compressed=False):
+            payload = {'game_id': f'g{index}', 'events': [{'t': k, 'd': 'UP'} for k in range(300)]}
+            stem = f'replay_2026-10-08T15-18-2{index}.725715_g{index}'
+            if compressed:
+                with open(os.path.join(_rt_dir, stem + '.json.gz'), 'wb') as _fh:
+                    _fh.write(gzip.compress(json.dumps(payload, indent=2).encode('utf-8'), 1))
+            else:
+                with open(os.path.join(_rt_dir, stem + '.json'), 'w', encoding='utf-8') as _fh:
+                    json.dump(payload, _fh, indent=2)
+            return stem[len('replay_'):]
+        _rt_ids = [_rt_make(1), _rt_make(2), _rt_make(3, True), _rt_make(4)]
+        with open(os.path.join(_rt_dir, 'replay_stale.json.tmp'), 'w') as _fh:
+            _fh.write('x' * 100)
+        _rt_unknown = replay_storage_scan(_rt_dir, None)
+        assert replay_storage_estimate_clean(_rt_unknown) == (1, 100)  # only the temp file
+        _rt_scan = replay_storage_scan(_rt_dir, set(_rt_ids[:3]))
+        assert [e['referenced'] for e in _rt_scan['replays']] == [True, True, True, False]
+        assert _replay_display_name(_rt_ids[0]) == '08/10/2026 - 15:18:21.725715'
+        _rt_before = sum(e['size'] for e in _rt_scan['replays'])
+        _rt_estimate = replay_storage_estimate_compress(_rt_scan, 'balanced')
+        _rt_result = replay_storage_compress(_rt_scan['replays'], 'maximum')
+        assert _rt_result['errors'] == 0 and _rt_result['done'] == 4
+        _rt_after_scan = replay_storage_scan(_rt_dir, set(_rt_ids[:3]))
+        _rt_after = sum(e['size'] for e in _rt_after_scan['replays'])
+        assert _rt_before - _rt_after == _rt_result['saved'] > 0
+        assert abs(_rt_estimate - _rt_result['saved']) <= _rt_result['saved'] * 0.25
+        assert all(e['compressed'] for e in _rt_after_scan['replays'])
+        for _rt_entry in _rt_after_scan['replays']:
+            assert _replay_read_payload(_rt_entry)['events'][5] == {'t': 5, 'd': 'UP'}
+        assert replay_storage_clean(_rt_after_scan) == (2, _rt_after_scan['replays'][3]['size'] + 100)
+        _rt_final = replay_storage_scan(_rt_dir, set(_rt_ids[:3]))
+        assert len(_rt_final['replays']) == 3 and not _rt_final['temp_files']
+        _rt_deleted = replay_storage_delete(_rt_final['replays'][:1])
+        assert _rt_deleted[0] == 1 and _rt_deleted[1] > 0
+        assert len(replay_storage_scan(_rt_dir, None)['replays']) == 2
+    results.append('replay_storage_tools_clean_compress_organize_delete')
+
+    # Update check: version ordering, repository parsing, safe URLs, throttle.
+    assert _update_is_newer('1.10.0', '1.9.0') and not _update_is_newer('1.0', '1.0.0')
+    assert _update_is_newer('v2', '1.9.9') and not _update_is_newer('garbage', '1.0.0')
+    def _upd_fetch(release=None, source=None):
+        def _fetch(url, headers, limit):
+            if 'releases/latest' in url:
+                return (200, json.dumps(release).encode()) if release is not None else (404, b'')
+            if source is not None and url.endswith('/' + source[0]):
+                return 206, source[1].encode()
+            return 404, b''
+        return _fetch
+    _upd_release = {'tag_name': 'v1.2.0', 'body': 'Notes',
+                    'html_url': 'https://github.com/' + GAME_UPDATE_REPO + '/releases/tag/v1.2.0',
+                    'assets': [{'name': 'SGF.exe', 'browser_download_url':
+                                'https://github.com/' + GAME_UPDATE_REPO + '/releases/download/v1.2.0/SGF.exe'}]}
+    _upd_info = fetch_update_info('1.0.0', _upd_fetch(_upd_release), frozen=True)
+    assert _upd_info['status'] == 'available' and _upd_info['asset'] == 'SGF.exe'
+    assert fetch_update_info('1.0.0', _upd_fetch(None, ('SGF', 'x\nGAME_VERSION = "1.1.0"\n')),
+                             frozen=False)['version'] == '1.1.0'   # file is still named "SGF"
+    assert fetch_update_info('1.1.0', _upd_fetch(None, ('SGF.py', 'GAME_VERSION = "1.1.0"\n')),
+                             frozen=False)['status'] == 'up_to_date'
+    assert fetch_update_info('1.0.0', _upd_fetch(None, None), frozen=True)['status'] == 'up_to_date'
+    def _upd_offline(*_args):
+        raise OSError('offline')
+    assert fetch_update_info('1.0.0', _upd_offline, frozen=False)['status'] == 'error'
+    _upd_evil = dict(_upd_release, tag_name='v9.0.0', html_url='https://evil.example/x')
+    assert fetch_update_info('1.0.0', _upd_fetch(_upd_evil), frozen=True)['url'].startswith(
+        'https://github.com/' + GAME_UPDATE_REPO)
+    assert _update_check_due({'enabled': True, 'last_check': 0.0}, now=10 ** 7)
+    assert _update_check_due({'enabled': True, 'last_check': 10 ** 7 - 60.0}, now=10 ** 7)  # every launch
+    assert not _update_check_due({'enabled': False, 'last_check': 0.0}, now=10 ** 7)
+    results.append('update_check_versions_sources_safe_urls_and_throttle')
+
+    # Auto-install: verified replacement of the script, with backup, and the
+    # cases where it must refuse.
+    with _tempfile.TemporaryDirectory() as _up_dir:
+        _up_script = os.path.join(_up_dir, 'SGF.py')
+        with open(_up_script, 'w', encoding='utf-8') as _fh:
+            _fh.write('GAME_VERSION = "1.0.0"\nprint("old")\nif __name__ == "__main__":\n    pass\n')
+        _up_new = 'GAME_VERSION = "1.1.0"\nprint("new")\nif __name__ == "__main__":\n    pass\n'
+        _up_info = {'status': 'available', 'local': '1.0.0', 'version': '1.1.0', 'file': 'SGF.py'}
+        def _up_fetch(body, status=200):
+            return lambda url, headers, limit: (status, body.encode('utf-8') if isinstance(body, str) else body)
+        for _bad_body in ('GAME_VERSION = "1.0.0"\nif __name__ == "__main__": pass\n',   # not newer
+                          'GAME_VERSION = "1.1.0"\ndef broken(:\n',                     # syntax error
+                          'GAME_VERSION = "1.1.0"\nprint(1)\n',                         # no __main__
+                          b'\xff\xfe not utf8'):
+            _ok, _why = update_install_source(_up_info, _up_script, _up_fetch(_bad_body))
+            assert not _ok and _why == 'checksum'
+        assert not update_install_source(_up_info, _up_script, _up_fetch(_up_new, 404))[0]
+        assert not update_install_source(dict(_up_info, file='evil.py'), _up_script, _up_fetch(_up_new))[0]
+        assert 'old' in open(_up_script, encoding='utf-8').read()      # untouched after every refusal
+        assert not [n for n in os.listdir(_up_dir) if n.endswith('.new')]
+        assert update_install_source(_up_info, _up_script, _up_fetch(_up_new)) == (True, '')
+        assert 'new' in open(_up_script, encoding='utf-8').read()
+        assert os.path.isfile(_up_script + '.1.0.0.bak')
+        assert _update_install_blocker(False, _up_script) is None
+        os.makedirs(os.path.join(_up_dir, '.git'))
+        assert _update_install_blocker(False, _up_script) == 'dev'
+        assert _update_install_blocker(False, os.path.join('x', '_snake_game_runtime', 'SGF.py')) == 'launcher'
+        # Release .exe: needs a matching SHA256SUMS entry.
+        _up_exe = os.path.join(_up_dir, 'SGF.exe')
+        _up_payload = b'MZ' + b'0' * 1000
+        _up_hash = hashlib.sha256(_up_payload).hexdigest()
+        _up_rel = {'asset': 'SGF.exe', 'asset_url': 'https://github.com/x/SGF.exe', 'sums_url': 'https://github.com/x/SHA256SUMS'}
+        def _up_exe_fetch(sums_text):
+            def _f(url, headers, limit):
+                return (200, sums_text.encode()) if url.endswith('SHA256SUMS') else (200, _up_payload)
+            return _f
+        assert update_stage_release(_up_rel, _up_exe, _up_exe_fetch('0' * 64 + '  SGF.exe\n')) == (False, 'checksum')
+        assert not os.path.exists(_up_exe + '.new')
+        assert update_stage_release(dict(_up_rel, sums_url=''), _up_exe, _up_exe_fetch('')) == (False, 'checksum')
+        assert update_stage_release(_up_rel, _up_exe, _up_exe_fetch(_up_hash + ' *SGF.exe\n')) == (True, '')
+        assert open(_up_exe + '.new', 'rb').read() == _up_payload
+    results.append('update_auto_install_verified_replace_backup_and_refusals')
     _storage_root_probe = os.path.join(os.getcwd(), '__virtual_sgf_storage__')
     _storage_files_probe = {
         os.path.join(_storage_root_probe, 'loose.bin'): 3,
@@ -49692,3 +51176,8 @@ if __name__ == "__main__":
     menu = MainMenu()
     menu.runtime.run_legacy("main_menu", menu.run, surface_owner=menu)
     menu.runtime.shutdown_application()
+    if getattr(menu, '_restart_after_exit', False):
+        try:
+            update_restart()
+        except Exception as _restart_exc:
+            sgf_log.warning('Could not restart after the update: %s', _restart_exc)
