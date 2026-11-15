@@ -817,7 +817,7 @@ def get_contrasting_text_color(bg_color):
 # did not expose game/API versions before the extension system, so these values are the stable
 # baseline for external content until a higher-level version manager provides
 # authoritative values.
-GAME_VERSION = "1.0.7"           # bump on release; single canonical definition
+GAME_VERSION = "1.0.8"           # bump on release; single canonical definition
 MOD_API_VERSION = "1.0.0"
 THEME_API_VERSION = "1.0.0"
 CONTENT_SCHEMA_VERSION = 1
@@ -43506,7 +43506,12 @@ AI_INPUT_GROUPS = (
     ('pu_shield', 'Shield', 1, False), ('pu_speed', 'Speed boost', 1, False), ('pu_slow', 'Slow motion', 1, False),
     ('pu_double', 'Double points', 1, False),
     ('mode', 'Game mode', 3, True),
+    # easier inputs, added at the end so that every AI saved before keeps its columns in the same place
+    ('position', 'Position (x, y)', 2, False), ('board_size', 'Board size', 2, False), ('danger', 'Danger next cell', 3, False),
+    ('fruit_rel', 'Fruit ahead / right', 2, False), ('free_space', 'Free space', 3, False),
 )
+AI_EASY_INPUTS = ('danger', 'fruit_rel', 'free_space', 'position')       # the ones that make learning easiest: in the Studio, one click adds them
+AI_FREE_SPACE_CAP = 60                                                    # the free space is counted up to this many cells (keeps it cheap on big boards)
 AI_INPUT_KEYS = tuple(g[0] for g in AI_INPUT_GROUPS)
 AI_DEFAULT_INPUTS = tuple(g[0] for g in AI_INPUT_GROUPS if g[3])
 AI_OUTPUT_NAMES = ('turn left', 'straight', 'turn right')
@@ -43529,6 +43534,16 @@ def ai_input_names(enabled):
                 names.extend(('Fruit dx', 'Fruit dy'))
             elif key == 'mode':
                 names.extend(('Mode solo', 'Mode versus', 'Mode co-op'))
+            elif key == 'position':
+                names.extend(('Position x', 'Position y'))
+            elif key == 'board_size':
+                names.extend(('Board width', 'Board height'))
+            elif key == 'danger':
+                names.extend(('Danger left', 'Danger ahead', 'Danger right'))
+            elif key == 'fruit_rel':
+                names.extend(('Fruit ahead', 'Fruit right'))
+            elif key == 'free_space':
+                names.extend(('Free space left', 'Free space ahead', 'Free space right'))
             else:
                 names.append(label)
     return names
@@ -43579,6 +43594,17 @@ def ai_extract_features(enabled, world):
     fruit = world.get('fruit')
     heading = _snake_head_direction(body, width, height)
     powerups = world.get('powerups') or {}
+    cells_ahead, solid = (), set()
+    if 'danger' in enabled or 'free_space' in enabled:
+        solid = set(tuple(p) for p in body[1:]) | set(tuple(p) for p in world.get('obstacles', ())) | others
+        dx, dy = heading
+        cells_ahead = []
+        for step_x, step_y in ((dy, -dx), (dx, dy), (-dy, dx)):               # the cell to the left, straight ahead and to the right
+            x, y = head[0] + step_x, head[1] + step_y
+            if wall:
+                cells_ahead.append((x, y) if 0 <= x < width and 0 <= y < height else None)
+            else:
+                cells_ahead.append((x % width, y % height))
     vector = []
     for key, _label, _size, _default in AI_INPUT_GROUPS:
         if key not in enabled:
@@ -43609,7 +43635,46 @@ def ai_extract_features(enabled, world):
             vector.extend((1.0 if mode == 'solo' else 0.0, 1.0 if mode == 'versus' else 0.0, 1.0 if mode == 'coop' else 0.0))
         elif key.startswith('pu_'):
             vector.append(max(0.0, min(1.0, float(powerups.get(key[3:], 0.0)))))
+        elif key == 'position':
+            vector.extend((head[0] / float(max(1, width - 1)), head[1] / float(max(1, height - 1))))
+        elif key == 'board_size':
+            vector.extend((min(1.0, width / 100.0), min(1.0, height / 100.0)))
+        elif key == 'danger':
+            vector.extend(1.0 if cell is None or cell in solid else 0.0 for cell in cells_ahead)
+        elif key == 'free_space':
+            vector.extend(0.0 if cell is None or cell in solid else _ai_free_space(cell, head, solid, width, height, wall) for cell in cells_ahead)
+        elif key == 'fruit_rel':
+            if fruit is None:
+                vector.extend((0.0, 0.0))
+            else:
+                dx, dy = heading
+                ox, oy = fruit[0] - head[0], fruit[1] - head[1]
+                reach = float(max(width, height))
+                vector.extend((max(-1.0, min(1.0, (ox * dx + oy * dy) / reach)), max(-1.0, min(1.0, (-ox * dy + oy * dx) / reach))))
     return vector
+
+
+def _ai_free_space(start, head, solid, width, height, wall):
+    """How much room there is behind a cell: the cells that can be reached from it without crossing the snake or an obstacle,
+    counted up to AI_FREE_SPACE_CAP and shown as a share of it (0 = a dead end, 1 = plenty)."""
+    cap = min(AI_FREE_SPACE_CAP, max(1, width * height - len(solid) - 1))
+    seen, queue, index = {start}, [start], 0
+    while index < len(queue) and len(seen) < cap:
+        x, y = queue[index]
+        index += 1
+        for step_x, step_y in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + step_x, y + step_y
+            if wall:
+                if not (0 <= nx < width and 0 <= ny < height):
+                    continue
+            else:
+                nx, ny = nx % width, ny % height
+            cell = (nx, ny)
+            if cell in seen or cell in solid or cell == head:
+                continue
+            seen.add(cell)
+            queue.append(cell)
+    return min(len(seen), cap) / float(cap)
 
 
 def _ai_activate(name, value):
@@ -44660,6 +44725,21 @@ class _DQNNumpy:
     def export(self, model):
         model.layers = [(w.tolist(), b.tolist()) for w, b in zip(self.W, self.b)]
 
+    def get_state(self):
+        """What the learning needs besides the weights: the target network and the optimiser's running averages."""
+        return {'t': int(self.t), 'tensors': [a.tolist() for a in self.tW + self.tb + self.m + self.v]}
+
+    def set_state(self, state):
+        np, mine = self.np, self.tW + self.tb + self.m + self.v
+        tensors = state['tensors']
+        if len(tensors) != len(mine):
+            raise ValueError('the saved state has another number of tensors')
+        arrays = [np.array(t, dtype=float) for t in tensors]
+        if any(a.shape != b.shape for a, b in zip(arrays, mine)):
+            raise ValueError('the saved state has other shapes')
+        n = len(self.W)
+        self.tW, self.tb, self.m, self.v, self.t = arrays[:n], arrays[n:2 * n], arrays[2 * n:4 * n], arrays[4 * n:6 * n], int(state['t'])
+
 
 class _DQNPython:
     """The same algorithm with plain lists, for computers without NumPy (slower, same result)."""
@@ -44743,6 +44823,280 @@ class _DQNPython:
 
     def export(self, model):
         model.layers = [([list(r) for r in w], list(b)) for w, b in zip(self.W, self.b)]
+
+    def get_state(self):
+        mine = self.tW + self.tb + self.m + self.v
+        return {'t': int(self.t), 'tensors': [_rl_copy_nested(t) for t in mine]}
+
+    def set_state(self, state):
+        mine, tensors = self.tW + self.tb + self.m + self.v, state['tensors']
+        if len(tensors) != len(mine) or any(_rl_tensor_shape(a) != _rl_tensor_shape(b) for a, b in zip(tensors, mine)):
+            raise ValueError('the saved state does not fit this network')
+        copies, n = [_rl_copy_nested(t) for t in tensors], len(self.W)
+        self.tW, self.tb, self.m, self.v, self.t = copies[:n], copies[n:2 * n], copies[2 * n:4 * n], copies[4 * n:6 * n], int(state['t'])
+
+
+def _rl_copy_nested(value):
+    return [_rl_copy_nested(v) for v in value] if isinstance(value, list) else value
+
+
+def _rl_tensor_shape(value):
+    shape = []
+    while isinstance(value, (list, tuple)):
+        shape.append(len(value))
+        value = value[0] if value else None
+    return shape
+
+
+def _rl_flatten(value, out):
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _rl_flatten(item, out)
+    else:
+        out.append(float(value))
+
+
+def _rl_unflatten(flat, shape, start=0):
+    """(nested lists with that shape built from flat[start:], the position after them)."""
+    if not shape:
+        return flat[start], start + 1
+    out = []
+    for _ in range(shape[0]):
+        item, start = _rl_unflatten(flat, shape[1:], start)
+        out.append(item)
+    return out, start
+
+
+RL_PRESET_MAX, RL_PRESET_NAME_MAX = 64, 32
+
+
+def rl_rewards_to_text(reward):
+    """The reward weights as text that can be pasted anywhere (a chat, a note) and back into the Studio."""
+    values = {key: float(reward.get(key, 0.0)) for key in RL_REWARD_KEYS if key in reward}
+    return json.dumps({'format': 'sgf-rewards', 'version': 1, 'rewards': values}, separators=(',', ':'))
+
+
+def rl_rewards_from_text(text):
+    """(values, skipped, problem) for pasted text: the reward weights it holds as {term: number}, how many entries were left
+    out (unknown terms, values that are not finite numbers or are out of range), and '' or the Studio label of the problem.
+    Accepts what rl_rewards_to_text writes, or a bare {term: number} object. Never raises."""
+    if not isinstance(text, str) or not text.strip() or len(text) > 200_000:
+        return None, 0, 'rw_paste_invalid'
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return None, 0, 'rw_paste_invalid'
+    if isinstance(data, dict) and isinstance(data.get('rewards'), dict):
+        data = data['rewards']
+    if not isinstance(data, dict):
+        return None, 0, 'rw_paste_invalid'
+    values, skipped = {}, 0
+    for key, value in data.items():
+        if (key in RL_REWARD_KEYS and isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and abs(value) <= RL_REWARD_LIMIT):
+            values[key] = float(value) + 0.0
+        else:
+            skipped += 1
+    return (values, skipped, '') if values else (None, skipped, 'rw_paste_invalid')
+
+
+def _rl_presets_path():
+    return os.path.join(studio_data_dir(), 'reward_presets.json')
+
+
+def rl_user_presets_clean(data):
+    """The player's own reward presets from a loaded file, read defensively: {name: {term: number}}."""
+    presets = data.get('presets') if isinstance(data, dict) else None
+    out = {}
+    if not isinstance(presets, dict):
+        return out
+    for name, values in list(presets.items())[:RL_PRESET_MAX]:
+        if not isinstance(name, str) or not isinstance(values, dict):
+            continue
+        name = ' '.join(name.split())
+        if not (1 <= len(name) <= RL_PRESET_NAME_MAX) or name in RL_REWARD_PRESETS:
+            continue
+        clean = {k: float(v) + 0.0 for k, v in values.items() if k in RL_REWARD_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool)
+                 and math.isfinite(v) and abs(v) <= RL_REWARD_LIMIT}
+        if clean:
+            out[name] = clean
+    return out
+
+
+def rl_user_presets_load():
+    try:
+        with open(_rl_presets_path(), 'r', encoding='utf-8') as handle:
+            return rl_user_presets_clean(json.load(handle))
+    except (OSError, ValueError, RecursionError):
+        return {}
+
+
+def rl_user_presets_save(presets):
+    os.makedirs(studio_data_dir(), exist_ok=True)
+    _atomic_write_json(_rl_presets_path(), {'format': 'sgf-reward-presets', 'version': 1, 'presets': presets})
+
+
+def rl_preset_names(user_presets):
+    """The built-in presets, then the player's own, in a fixed order."""
+    return list(RL_REWARD_PRESETS) + sorted(user_presets)
+
+
+def rl_preset_values(name, user_presets):
+    """The full {term: weight} of a preset (built in or the player's own), or None if there is none with that name."""
+    if name in RL_REWARD_PRESETS:
+        return rl_reward_spec(name)
+    if name in user_presets:
+        return dict(rl_default_reward(), **user_presets[name])
+    return None
+
+
+RL_STATE_MAGIC = b'SGFSTATE1'
+RL_STATE_MAX_TRANSITIONS, RL_STATE_MAX_PARAMS = 2_000_000, 8_000_000
+
+
+def rl_state_path(name):
+    """The file that keeps what the learning needs to carry on exactly where it stopped, for the AI with this name."""
+    return os.path.join(studio_data_dir(), _ai_file_name(name) + '.sgfstate')
+
+
+def rl_state_size(name):
+    try:
+        return os.path.getsize(rl_state_path(name))
+    except OSError:
+        return 0
+
+
+def rl_state_delete(name):
+    try:
+        os.remove(rl_state_path(name))
+    except OSError:
+        pass
+
+
+def rl_weights_digest(layers):
+    """A fingerprint of the weights, so a saved state is only used with the very weights it belongs to."""
+    import hashlib
+    from array import array
+    digest = hashlib.sha1()
+    for weights, biases in layers:
+        flat = array('d')
+        for row in weights:
+            flat.extend(row)
+        flat.extend(biases)
+        if sys.byteorder == 'big':
+            flat.byteswap()
+        digest.update(flat.tobytes())
+    return digest.hexdigest()
+
+
+def rl_state_pack(header, tensors, memory):
+    """The bytes of a training state: a JSON header, then the tensors (the target network and the optimiser's averages) and the
+    replay buffer as raw numbers, compressed. No pickle: nothing in it can run code."""
+    import zlib
+    from array import array
+    flat = array('d')
+    shapes = []
+    for tensor in tensors:
+        shapes.append(_rl_tensor_shape(tensor))
+        _rl_flatten(tensor, flat)
+    count = len(memory)
+    dim = len(memory[0][0]) if count else 0
+    states, nexts, actions, rewards, dones = array('f'), array('f'), array('b'), array('f'), array('b')
+    for s_, a_, r_, s2_, d_ in memory:
+        if len(s_) != dim or len(s2_) != dim:
+            raise ValueError('transitions of different sizes')
+        states.extend(s_)
+        nexts.extend(s2_)
+        actions.append(int(a_))
+        rewards.append(float(r_))
+        dones.append(1 if d_ else 0)
+    parts = [flat, states, nexts, actions, rewards, dones]
+    if sys.byteorder == 'big':
+        for part in parts:
+            part.byteswap()
+    head = json.dumps(dict(header, shapes=shapes, n=count, dim=dim, params=len(flat)), separators=(',', ':')).encode('utf-8')
+    return RL_STATE_MAGIC + struct.pack('<I', len(head)) + head + zlib.compress(b''.join(p.tobytes() for p in parts), 3)
+
+
+def rl_state_unpack(data):
+    """The header, tensors and transitions in a training-state file, or ValueError for anything that is not a well-formed one
+    (a wrong or cut file, absurd sizes, a compressed bomb). Never trusts the sizes it reads."""
+    import zlib
+    from array import array
+    if not isinstance(data, (bytes, bytearray)) or not data.startswith(RL_STATE_MAGIC) or len(data) < len(RL_STATE_MAGIC) + 4:
+        raise ValueError('not a training state')
+    (head_len,) = struct.unpack('<I', data[len(RL_STATE_MAGIC):len(RL_STATE_MAGIC) + 4])
+    start = len(RL_STATE_MAGIC) + 4
+    if head_len > 4_000_000 or start + head_len > len(data):
+        raise ValueError('damaged header')
+    header = json.loads(data[start:start + head_len].decode('utf-8'))
+    count, dim, params, shapes = header.get('n'), header.get('dim'), header.get('params'), header.get('shapes')
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (count, dim, params)) or not isinstance(shapes, list):
+        raise ValueError('damaged header')
+    if count > RL_STATE_MAX_TRANSITIONS or params > RL_STATE_MAX_PARAMS or dim > 4096 or (count and not dim):
+        raise ValueError('absurd sizes')
+    expected = params * 8 + count * dim * 8 + count * 2 + count * 4
+    decompressor = zlib.decompressobj()
+    body = decompressor.decompress(data[start + head_len:], expected + 1)
+    if len(body) != expected or decompressor.unconsumed_tail:
+        raise ValueError('the sizes do not match')
+    cursor = 0
+
+    def take(code, size):
+        nonlocal cursor
+        arr = array(code)
+        arr.frombytes(body[cursor:cursor + size * arr.itemsize])
+        cursor += size * arr.itemsize
+        if sys.byteorder == 'big':
+            arr.byteswap()
+        return arr
+    flat, states, nexts = take('d', params), take('f', count * dim), take('f', count * dim)
+    actions, rewards, dones = take('b', count), take('f', count), take('b', count)
+    tensors, at = [], 0
+    for shape in shapes:
+        if not isinstance(shape, list) or not all(isinstance(v, int) and v >= 0 for v in shape):
+            raise ValueError('damaged shapes')
+        size = 1
+        for extent in shape:
+            size *= extent
+        if at + size > len(flat):
+            raise ValueError('damaged shapes')
+        tensor, _ = _rl_unflatten(list(flat), shape, at)
+        tensors.append(tensor)
+        at += size
+    if at != len(flat) or not all(0 <= a <= 2 for a in actions):
+        raise ValueError('damaged tensors')
+    memory = [(list(states[i * dim:(i + 1) * dim]), int(actions[i]), float(rewards[i]), list(nexts[i * dim:(i + 1) * dim]), float(dones[i]))
+              for i in range(count)]
+    return header, tensors, memory
+
+
+def rl_state_load(path, model, reward):
+    """(status, payload). status: 'loaded' (payload has 'tensors', 't', 'memory', 'buffer_kept', 'epsilon'), 'missing', or
+    'ignored:<why>' when the file does not belong to this AI as it is now (other layout, other weights, damaged)."""
+    try:
+        if os.path.getsize(path) > 512 * 1024 * 1024:
+            return 'ignored:too big', None
+        with open(path, 'rb') as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return 'missing', None
+    except OSError as exc:
+        return f'ignored:{type(exc).__name__}', None
+    try:
+        header, tensors, memory = rl_state_unpack(data)
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, struct.error, _zlib_mod.error) as exc:
+        return f'ignored:damaged ({exc})', None
+    if header.get('inputs') != list(model.inputs) or header.get('hidden') != list(model.hidden) or header.get('activation') != model.activation:
+        return 'ignored:other layout', None
+    if header.get('digest') != rl_weights_digest(model.layers):
+        return 'ignored:the AI has other weights than when it was saved', None
+    same_reward = header.get('reward') == json.loads(json.dumps(dict(reward)))
+    t = header.get('t')
+    if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+        return 'ignored:damaged', None
+    return 'loaded', {'tensors': tensors, 't': t, 'memory': memory if same_reward else [], 'buffer_kept': same_reward,
+                      'epsilon': header.get('epsilon')}
 
 
 def rl_make_dqn(model, lr=0.001, gamma=0.97, seed=0, backend='auto'):
@@ -44833,6 +45187,45 @@ RL_DEFAULT_CONFIG = {'gamma': 0.97, 'lr': 0.001, 'batch': 32, 'buffer': 20000, '
 RL_HISTORY_KEYS = ('total', 'avg_fruits', 'avg_reward', 'epsilon', 'loss')
 
 
+def studio_data_dir():
+    """Where the Studio keeps what is not an AI itself: the saved training state, the last set-up and the player's reward presets."""
+    return os.path.join(ai_library_dir(), 'state')
+
+
+def rl_clean_setup(data):
+    """A saved Studio set-up (mode, learners, bots, board, duration, layers...) read defensively: anything missing or invalid is
+    simply left out, so a damaged file never breaks the Studio. Returns a dict with only valid entries."""
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    def number(key, low, high):
+        value = data.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
+            out[key] = value
+    number('mode', 0, 3)
+    number('learners', 1, 4)
+    number('bots', 0, len(STUDIO_BOTS) - 1)
+    number('steps', 0, len(STUDIO_STEPS) - 1)
+    number('hidden', 0, len(STUDIO_HIDDEN) - 1)
+    number('activation', 0, len(AI_ACTIVATIONS) - 1)
+    number('chart_rate', 0, 4)
+    board = data.get('board')
+    if (isinstance(board, list) and len(board) == 2 and all(isinstance(v, int) and not isinstance(v, bool) and RL_BOARD_MIN <= v <= RL_BOARD_MAX for v in board)):
+        out['board'] = [board[0], board[1]]
+    hms = data.get('hms')
+    if (isinstance(hms, list) and len(hms) == 3 and all(isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= 999 for v in hms)
+            and RL_MIN_SECONDS <= hms[0] * 3600 + hms[1] * 60 + hms[2] <= RL_MAX_SECONDS):
+        out['hms'] = list(hms)
+    for key in ('powerups', 'explore_restart'):
+        if isinstance(data.get(key), bool):
+            out[key] = data[key]
+    if data.get('duration') in ('steps', 'time', 'continuous'):
+        out['duration'] = data['duration']
+    if data.get('chart_mode') in ('both', 'fruits', 'reward'):
+        out['chart_mode'] = data['chart_mode']
+    return out
+
+
 def rl_clean_history(rl):
     """The chart history stored with an AI (meta['rl']['history']), read defensively: a damaged or hostile file gives an
     empty list or fewer points, never an error. Every point has the total steps trained so far and the training averages."""
@@ -44874,7 +45267,7 @@ def rl_resume_epsilon(previous, cfg, explore='continue'):
 
 def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, config=None, backend='auto',
                  on_progress=None, should_stop=None, duration=None, on_autosave=None, autosave_every=120.0, history=None,
-                 explore='continue'):
+                 explore='continue', state_path=None):
     """Train `model` (an AIModel, whose three outputs are the Q-values of turn left / straight / turn right) by deep
     Q-learning in an RLEnv. It ends after `steps` environment steps, or after `duration` seconds, whichever comes first;
     with `steps=None` and no `duration` it runs until `should_stop()` says so. `on_autosave(model)` is called every
@@ -44882,7 +45275,10 @@ def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, confi
     the chart points (thinned in place when it grows past RL_MAX_CHECKPOINTS). Returns {'episodes': [...], 'checkpoints':
     [...], 'backend': name, 'elapsed': seconds, 'stopped_by': 'steps' | 'time' | 'stop'}. The model's weights are
     replaced by the trained ones and `model.meta['rl']` records how: the steps trained so far, where the exploration
-    stopped (so the next run carries on from there, unless `explore='restart'`) and the chart history."""
+    stopped (so the next run carries on from there, unless `explore='restart'`) and the chart history. With `state_path`, what
+    the learning needs besides the weights (the target network, the optimiser and the replay buffer) is saved there when the
+    run ends and every autosave, and loaded at the start if it belongs to these very weights, so stopping and starting again
+    carries on exactly where it stopped. The result's 'state' says what happened to it."""
     cfg = dict(RL_DEFAULT_CONFIG, **(config or {}))
     reward = reward or rl_reward_spec()
     env = RLEnv(model, env_config, reward, seed)
@@ -44897,6 +45293,37 @@ def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, confi
     prior_history = rl_clean_history(previous)
     eps0 = rl_resume_epsilon(previous, cfg, explore)
     eps = eps0
+    state_info = {'loaded': 'none', 'buffer_kept': False, 'saved': False, 'bytes': 0, 'error': ''}
+    if state_path and base_steps > 0:
+        status, payload = rl_state_load(state_path, model, reward)
+        state_info['loaded'] = status
+        if payload is not None:
+            try:
+                net.set_state({'t': payload['t'], 'tensors': payload['tensors']})
+                memory = payload['memory'][-capacity:]
+                state_info['buffer_kept'] = payload['buffer_kept'] and bool(memory)
+            except ValueError as exc:
+                state_info['loaded'] = f'ignored:{exc}'
+                memory = []
+    restored_buffer = bool(memory)                                       # a restored buffer needs no warm-up: it learns at once
+
+    def save_state(done_steps):
+        """Write the learning state next to the weights it belongs to (called after net.export(model))."""
+        if not state_path:
+            return
+        try:
+            ordered = memory[position:] + memory[:position] if len(memory) >= capacity else list(memory)
+            parts = net.get_state()
+            header = {'inputs': list(model.inputs), 'hidden': list(model.hidden), 'activation': model.activation,
+                      'digest': rl_weights_digest(model.layers), 't': parts['t'], 'reward': json.loads(json.dumps(dict(reward))),
+                      'steps_trained': base_steps + done_steps, 'epsilon': round(float(eps), 4),
+                      'saved_at': datetime.now().isoformat(timespec='seconds')}
+            data = rl_state_pack(header, parts['tensors'], ordered)
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            _atomic_write_bytes(state_path, data)
+            state_info.update(saved=True, bytes=len(data), error='')
+        except Exception as exc:                                         # a cache that cannot be written never ends the training
+            state_info['error'] = f'{type(exc).__name__}: {exc}'
 
     def record(done_steps):
         """Write what this run has done into the model, so a copy taken now (autosave) or at the end is complete."""
@@ -44953,7 +45380,7 @@ def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, confi
                 memory[position] = transition
                 position = (position + 1) % capacity
             learner_steps += 1
-        if step >= cfg['warmup'] and step % int(cfg['learn_every']) == 0 and len(memory) >= batch:
+        if (step >= cfg['warmup'] or restored_buffer) and step % int(cfg['learn_every']) == 0 and len(memory) >= batch:
             sample = rng.sample(memory, batch)
             S, A, R, S2, D = zip(*sample)
             losses.append(net.train(S, A, R, S2, D))
@@ -44974,6 +45401,7 @@ def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, confi
             try:
                 net.export(model)
                 record(step)
+                save_state(step)
                 on_autosave(model)
             except Exception as exc:                  # a failed backup must not end the training; it is reported at the end
                 autosave_error = f'{type(exc).__name__}: {exc}'
@@ -44992,8 +45420,9 @@ def rl_train_dqn(model, reward=None, env_config=None, steps=20000, seed=0, confi
                 on_progress(step + 1, int(limit or 0), point)
     net.export(model)
     record(executed)
+    save_state(executed)
     return {'episodes': list(episodes), 'checkpoints': list(checkpoints), 'backend': backend_used, 'steps_done': executed,
-            'elapsed': time.monotonic() - started, 'stopped_by': stopped_by, 'autosave_error': autosave_error}
+            'elapsed': time.monotonic() - started, 'stopped_by': stopped_by, 'autosave_error': autosave_error, 'state': state_info}
 
 
 def rl_evaluate(model, reward=None, env_config=None, episodes=20, seed=1234):
@@ -45123,6 +45552,54 @@ _STUDIO_LABELS['pt_PT'].update({
     'chart_reward': 'Gráfico: recompensa', 'chart_rate': 'Atualizar: {value}', 'rate_steps': 'a cada {n} passos', 'rate_seconds': 'a cada {n} s',
     'chart_empty': 'O gráfico aparece quando a IA treina', 'axis_steps': 'Passos', 'axis_fruits': 'Frutas', 'axis_reward': 'Recompensa',
 })
+_STUDIO_LABELS['en'].update({
+    'confirm_rebuild': 'Rebuild this AI? Its {steps} steps of training, its chart and its rating will be lost, because the layout changes and the learned weights no longer fit.',
+    'confirm_discard': 'This AI has {steps} steps of training that were not saved. Continue and lose them?',
+    'confirm_yes': 'Yes, continue', 'confirm_no': 'Cancel', 'rebuilt': 'The AI was rebuilt with the chosen layers.',
+    'layout_pending': 'The layers changed: press Rebuild to apply them.',
+    'layout_pending_trained': 'Changing the layers resets the AI: its {steps} steps of training will be lost when you press Rebuild.',
+})
+_STUDIO_LABELS['pt_PT'].update({
+    'confirm_rebuild': 'Reconstruir esta IA? Os {steps} passos de treino, o gráfico e a qualidade perdem-se, porque o formato muda e os pesos aprendidos já não servem.',
+    'confirm_discard': 'Esta IA tem {steps} passos de treino que não foram guardados. Continuar e perdê-los?',
+    'confirm_yes': 'Sim, continuar', 'confirm_no': 'Cancelar', 'rebuilt': 'A IA foi reconstruída com as camadas escolhidas.',
+    'layout_pending': 'As camadas mudaram: carrega em Refazer para as aplicar.',
+    'layout_pending_trained': 'Mudar as camadas repõe a IA: os {steps} passos de treino perdem-se quando carregares em Refazer.',
+})
+_STUDIO_LABELS['en'].update({
+    'state_size': 'Cache: {mb} MB', 'state_restored': 'Training state restored.', 'state_ignored': 'The saved training state was not used ({why}).',
+    'state_failed': 'The training state could not be saved: {reason}',
+})
+_STUDIO_LABELS['pt_PT'].update({
+    'state_size': 'Cache: {mb} MB', 'state_restored': 'Estado do treino restaurado.', 'state_ignored': 'O estado de treino guardado não foi usado ({why}).',
+    'state_failed': 'Não foi possível guardar o estado do treino: {reason}',
+})
+_STUDIO_LABELS['en'].update({
+    'rw_copy': 'Copy', 'rw_paste': 'Paste', 'rw_save': 'Save', 'rw_del': 'Delete', 'preset_custom': 'custom', 'preset_name_prompt': 'Preset name',
+    'rw_copied': 'Reward values copied ({n} terms).', 'rw_copy_failed': 'No clipboard here: the values were saved in {path}.', 'rw_copy_nowhere': 'The values could not be copied.',
+    'rw_pasted': 'Reward values pasted ({n} terms{extra}).', 'rw_skipped': '{n} skipped', 'rw_paste_invalid': 'Nothing to paste: the clipboard has no reward values.',
+    'preset_saved': 'Preset "{name}" saved.', 'preset_name_empty': 'Type a name for the preset.', 'preset_name_builtin': '"{name}" is a built-in preset: choose another name.',
+    'preset_limit': 'There are already {n} presets: delete one first.', 'confirm_delete_preset': 'Delete the preset "{name}"?', 'preset_deleted': 'Preset "{name}" deleted.',
+    'preset_failed': 'The preset could not be saved: {reason}',
+})
+_STUDIO_LABELS['pt_PT'].update({
+    'rw_copy': 'Copiar', 'rw_paste': 'Colar', 'rw_save': 'Guardar', 'rw_del': 'Apagar', 'preset_custom': 'personalizado', 'preset_name_prompt': 'Nome do preset',
+    'rw_copied': 'Valores das recompensas copiados ({n} termos).', 'rw_copy_failed': 'Não há área de transferência aqui: os valores ficaram em {path}.', 'rw_copy_nowhere': 'Não foi possível copiar os valores.',
+    'rw_pasted': 'Valores das recompensas colados ({n} termos{extra}).', 'rw_skipped': '{n} ignorados', 'rw_paste_invalid': 'Nada para colar: a área de transferência não tem valores de recompensas.',
+    'preset_saved': 'Preset "{name}" guardado.', 'preset_name_empty': 'Escreve um nome para o preset.', 'preset_name_builtin': '"{name}" é um preset do jogo: escolhe outro nome.',
+    'preset_limit': 'Já existem {n} presets: apaga um primeiro.', 'confirm_delete_preset': 'Apagar o preset "{name}"?', 'preset_deleted': 'Preset "{name}" apagado.',
+    'preset_failed': 'Não foi possível guardar o preset: {reason}',
+})
+_STUDIO_LABELS['en'].update({
+    'inputs_easy': 'Add easy inputs', 'inputs_easy_have': 'The easy inputs are already on.',
+    'inputs_easy_added': 'Added danger, fruit ahead/right, free space and position. New inputs start small, so train again.',
+    'inputs_changed': 'Inputs changed: the AI keeps what it learned for the inputs it already had; new inputs start small, so train again.',
+})
+_STUDIO_LABELS['pt_PT'].update({
+    'inputs_easy': 'Juntar inputs fáceis', 'inputs_easy_have': 'Os inputs fáceis já estão ligados.',
+    'inputs_easy_added': 'Juntei perigo, fruta à frente/direita, espaço livre e posição. Os inputs novos começam pequenos, por isso treina de novo.',
+    'inputs_changed': 'Inputs alterados: a IA mantém o que aprendeu para os inputs que já tinha; os novos começam pequenos, por isso treina de novo.',
+})
 _STUDIO_LABELS['pt_BR'] = dict(_STUDIO_LABELS['pt_PT'], delete='Excluir', deleted='Excluída "{name}".', saved='Salva "{name}".',
                                save='Salvar', loading='Carregando a IA...', training='Treinando {pct}%',
                                benchmarking='Avaliando...', board='Tabuleiro', new='Nova IA',
@@ -45138,6 +45615,19 @@ _STUDIO_LABELS['pt_BR'] = dict(_STUDIO_LABELS['pt_PT'], delete='Excluir', delete
                                val_powerups='Power-ups em um tabuleiro tão pequeno deixam pouco espaço para jogar.',
                                autosave_failed='O backup falhou: {reason}')
 _STUDIO_LABELS['pt_BR'].update({
+    'inputs_easy': 'Adicionar inputs fáceis', 'inputs_easy_have': 'Os inputs fáceis já estão ligados.',
+    'inputs_easy_added': 'Adicionei perigo, fruta à frente/direita, espaço livre e posição. Os inputs novos começam pequenos, então treine de novo.',
+    'inputs_changed': 'Inputs alterados: a IA mantém o que aprendeu para os inputs que já tinha; os novos começam pequenos, então treine de novo.',
+    'rw_save': 'Salvar', 'rw_del': 'Excluir', 'rw_copy_failed': 'Sem área de transferência aqui: os valores foram salvos em {path}.',
+    'preset_saved': 'Preset "{name}" salvo.', 'preset_name_empty': 'Digite um nome para o preset.', 'preset_name_builtin': '"{name}" é um preset do jogo: escolha outro nome.',
+    'preset_limit': 'Já existem {n} presets: exclua um primeiro.', 'confirm_delete_preset': 'Excluir o preset "{name}"?', 'preset_deleted': 'Preset "{name}" excluído.',
+    'preset_failed': 'Não foi possível salvar o preset: {reason}', 'rw_pasted': 'Valores das recompensas colados ({n} termos{extra}).',
+    'state_ignored': 'O estado de treino salvo não foi usado ({why}).', 'state_failed': 'Não foi possível salvar o estado do treino: {reason}',
+    'confirm_rebuild': 'Reconstruir esta IA? Os {steps} passos de treino, o gráfico e a qualidade serão perdidos, porque o formato muda e os pesos aprendidos não servem mais.',
+    'confirm_discard': 'Esta IA tem {steps} passos de treino que não foram salvos. Continuar e perdê-los?',
+    'confirm_yes': 'Sim, continuar', 'rebuilt': 'A IA foi reconstruída com as camadas escolhidas.',
+    'layout_pending': 'As camadas mudaram: clique em Refazer para aplicá-las.',
+    'layout_pending_trained': 'Mudar as camadas reinicia a IA: os {steps} passos de treino serão perdidos quando você clicar em Refazer.',
     'rewards': 'Funções de recompensa (clique em - / + para mudar um peso, clique em um número para digitar qualquer valor, a seta circular restaura o valor)',
     'name_required': 'Para salvar é preciso um nome: digite um na caixa do nome.', 'name_hint': 'Digite um nome (obrigatório para salvar)',
     'reward_invalid': 'Isso não é um número: o valor ficou como estava.', 'reward_range': 'O valor precisa estar entre -{max} e {max}; ficou como estava.',
@@ -45220,6 +45710,9 @@ class AIStudioScreen:
         self.speed = {'visible': [0, 0.0], 'minimized': [0, 0.0]}        # steps and seconds of the last training, by window state
         self._speed_last = None
         self._name_area = self._name_font = None
+        self.confirm = None                                               # a question waiting for Yes or Cancel: {'text', 'yes'}
+        self.state_bytes = 0                                              # size of the saved training state of this AI
+        self.saved_steps, self._setup_seen = 0, None                      # steps the AI had when it was last saved; the set-up last written
         self.preset_index = 0
         self.mode_index, self.learners, self.bots_index = 0, 1, 0
         self.board_index, self.powerups = 1, True
@@ -45230,6 +45723,8 @@ class AIStudioScreen:
         self.checkpoints = []
         self.model = None
         self.reward = rl_reward_spec()
+        self.setup_last = self._read_last_setup()
+        self.user_presets = rl_user_presets_load()                           # the player's own reward presets
         names = sorted(AI_REGISTRY)
         self._adopt(AI_REGISTRY[names[0]] if names else AIModel.new('My AI', hidden=STUDIO_HIDDEN[self.hidden_index]))
 
@@ -45238,9 +45733,76 @@ class AIStudioScreen:
         self.model = model
         self.name_draft = model.name
         self.edit_target, self.editor = None, None
+        self.confirm = None
         rl = model.meta.get('rl') if isinstance(model.meta.get('rl'), dict) else {}
+        self.saved_steps = int(rl.get('steps_trained', 0)) if isinstance(rl.get('steps_trained'), (int, float)) else 0
+        self.state_bytes = rl_state_size(model.name)
+        self._setup_apply(rl_clean_setup(model.meta.get('studio')) or self.setup_last)          # this AI's own set-up, or the one used last
+        if tuple(model.hidden) in STUDIO_HIDDEN:                                                # the layer buttons start at what the AI really has
+            self.hidden_index = STUDIO_HIDDEN.index(tuple(model.hidden))
+        if model.activation in AI_ACTIVATIONS:
+            self.activation_index = AI_ACTIVATIONS.index(model.activation)
+        self._setup_seen = self._setup_snapshot()
         self.reward = dict(rl_reward_spec(), **{k: float(v) for k, v in (rl.get('reward') or {}).items() if k in RL_REWARD_KEYS})
         self.history, self.checkpoints, self.session_steps = rl_clean_history(rl), [], 0
+
+    # ---- the set-up (mode, learners, bots, board, duration, layers...) is remembered ----------------
+    def _setup_snapshot(self):
+        return {'mode': self.mode_index, 'learners': self.learners, 'bots': self.bots_index, 'board': [self.board_w, self.board_h],
+                'powerups': bool(self.powerups), 'duration': self.duration_kind, 'hms': list(self.duration_hms), 'steps': self.steps_index,
+                'hidden': self.hidden_index, 'activation': self.activation_index, 'explore_restart': bool(self.explore_restart),
+                'chart_mode': self.chart.mode, 'chart_rate': self.chart_rate_index}
+
+    def _setup_apply(self, data):
+        if not data:
+            return
+        self.mode_index, self.learners, self.bots_index = data.get('mode', self.mode_index), data.get('learners', self.learners), data.get('bots', self.bots_index)
+        self.board_w, self.board_h = data.get('board', [self.board_w, self.board_h])
+        self.board_index = STUDIO_BOARDS.index((self.board_w, self.board_h)) if (self.board_w, self.board_h) in STUDIO_BOARDS else self.board_index
+        self.powerups, self.duration_kind = data.get('powerups', self.powerups), data.get('duration', self.duration_kind)
+        self.duration_hms = list(data.get('hms', self.duration_hms))
+        self.steps_index, self.hidden_index = data.get('steps', self.steps_index), data.get('hidden', self.hidden_index)
+        self.activation_index, self.explore_restart = data.get('activation', self.activation_index), data.get('explore_restart', self.explore_restart)
+        self.chart.mode, self.chart_rate_index = data.get('chart_mode', self.chart.mode), data.get('chart_rate', self.chart_rate_index)
+
+    @staticmethod
+    def _setup_path():
+        return os.path.join(studio_data_dir(), '_studio_setup.json')
+
+    def _read_last_setup(self):
+        try:
+            with open(self._setup_path(), 'r', encoding='utf-8') as handle:
+                return rl_clean_setup(json.load(handle))
+        except (OSError, ValueError):
+            return {}
+
+    def _setup_tick(self):
+        """Called every frame: when the set-up changed, keep it with the AI (so it goes with the saved file) and as the last used one."""
+        snapshot = self._setup_snapshot()
+        if snapshot == self._setup_seen:
+            return
+        self._setup_seen = snapshot
+        self.setup_last = rl_clean_setup(snapshot)
+        if self.model is not None:
+            self.model.meta['studio'] = snapshot
+        try:
+            os.makedirs(studio_data_dir(), exist_ok=True)
+            _atomic_write_json(self._setup_path(), snapshot)
+        except OSError:
+            pass                                                            # not being able to remember the set-up is never fatal
+
+    # ---- a question that needs Yes or Cancel ----------------------------------------------------
+    def _ask(self, key, yes, **values):
+        self.confirm = {'text': _studio_label(self.language, key, **values), 'yes': yes}
+
+    def unsaved_steps(self):
+        rl = self.model.meta.get('rl') if isinstance(self.model.meta.get('rl'), dict) else {}
+        steps = int(rl.get('steps_trained', 0)) if isinstance(rl.get('steps_trained'), (int, float)) else 0
+        return max(0, steps - self.saved_steps)
+
+    def layout_pending(self):
+        """True when the layer buttons ask for something other than what the AI has (it only changes on Rebuild)."""
+        return tuple(STUDIO_HIDDEN[self.hidden_index]) != tuple(self.model.hidden) or AI_ACTIVATIONS[self.activation_index] != self.model.activation
 
     def env_config(self):
         width, height = self.board_w, self.board_h
@@ -45288,14 +45850,14 @@ class AIStudioScreen:
             self.duration_hms = [fitted // 3600, fitted % 3600 // 60, fitted % 60]      # 90 minutes becomes 1 h 30 m
 
     # ---- typing into a box (the name, a number box, a reward value) -------------------------------
-    TEXT_HITS = ('rename', 'sz_w', 'sz_h', 't_h', 't_m', 't_s')
+    TEXT_HITS = ('rename', 'sz_w', 'sz_h', 't_h', 't_m', 't_s', 'rw_name')
 
     def is_text_hit(self, name):
         return name in self.TEXT_HITS or name.startswith('wr_')
 
     @staticmethod
     def _hit_name(target):
-        return 'rename' if target == 'name' else ('wr_' + target[3:] if target.startswith('wr:') else target)
+        return 'rename' if target == 'name' else ('rw_name' if target == 'preset_name' else ('wr_' + target[3:] if target.startswith('wr:') else target))
 
     def _start_edit(self, target, pos=None):
         self._commit_edit()
@@ -45303,6 +45865,9 @@ class AIStudioScreen:
             editor = TextEditor(self.name_draft, 40, lambda ch: ch.isalnum() or ch in ' -_')
             if pos is not None and self._name_area is not None:
                 editor.caret = editor.caret_from_x(pos[0] - self._name_area.x, self._name_font)
+        elif target == 'preset_name':
+            current = self.matching_preset()
+            editor = TextEditor(current if current in self.user_presets else '', RL_PRESET_NAME_MAX, lambda ch: ch.isalnum() or ch in ' -_')
         elif target in self.FIELDS:
             editor = TextEditor('', 6, lambda ch: ch.isascii() and ch.isdigit())
         else:
@@ -45318,6 +45883,9 @@ class AIStudioScreen:
         self._stop_edit()
         if target is None or target == 'name':
             return                                                          # the name is applied as it is typed
+        if target == 'preset_name':
+            self._save_preset(editor.text)
+            return
         text = editor.text.strip()
         if target in self.FIELDS:
             if text.isascii() and text.isdigit():
@@ -45396,6 +45964,69 @@ class AIStudioScreen:
             if self.editor is not None and self.editor.key(event) == 'changed':
                 self._edit_changed()
 
+    # ---- reward presets, copy and paste -----------------------------------------------------------
+    def matching_preset(self):
+        """The name of the preset whose values are exactly the ones on screen, or None (the player changed something)."""
+        for name in rl_preset_names(self.user_presets):
+            if rl_preset_values(name, self.user_presets) == self.reward:
+                return name
+        return None
+
+    def _save_preset(self, raw_name):
+        name = ' '.join(str(raw_name).split())
+        if not name:
+            self.message = _studio_label(self.language, 'preset_name_empty')
+        elif name in RL_REWARD_PRESETS:
+            self.message = _studio_label(self.language, 'preset_name_builtin', name=name)
+        elif name not in self.user_presets and len(self.user_presets) >= RL_PRESET_MAX:
+            self.message = _studio_label(self.language, 'preset_limit', n=RL_PRESET_MAX)
+        else:
+            self.user_presets[name] = {key: float(self.reward[key]) for key in RL_REWARD_KEYS if key in self.reward}
+            try:
+                rl_user_presets_save(self.user_presets)
+            except OSError as exc:
+                self.message = _studio_label(self.language, 'preset_failed', reason=f'{type(exc).__name__}: {exc}')
+                return
+            self.preset_index = rl_preset_names(self.user_presets).index(name)
+            self.message = _studio_label(self.language, 'preset_saved', name=name)
+
+    def delete_preset(self, confirmed=False):
+        name = self.matching_preset()
+        if name not in self.user_presets:
+            return
+        if not confirmed:
+            self._ask('confirm_delete_preset', lambda: self.delete_preset(True), name=name)
+            return
+        del self.user_presets[name]
+        try:
+            rl_user_presets_save(self.user_presets)
+        except OSError:
+            pass
+        self.preset_index = 0
+        self.message = _studio_label(self.language, 'preset_deleted', name=name)
+
+    def copy_rewards(self):
+        text = rl_rewards_to_text(self.reward)
+        if _copy_to_clipboard(text):
+            self.message = _studio_label(self.language, 'rw_copied', n=len(self.reward))
+            return
+        path = os.path.join(studio_data_dir(), 'rewards_copy.txt')               # no clipboard on this system: keep it in a file instead
+        try:
+            os.makedirs(studio_data_dir(), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            self.message = _studio_label(self.language, 'rw_copy_failed', path=path)
+        except OSError:
+            self.message = _studio_label(self.language, 'rw_copy_nowhere')
+
+    def paste_rewards(self):
+        values, skipped, problem = rl_rewards_from_text(_read_from_clipboard() or '')
+        if problem:
+            self.message = _studio_label(self.language, problem)
+            return
+        self.reward = dict(rl_default_reward(), **values)                       # a pasted set replaces the whole set; what it leaves out is the default
+        self.message = _studio_label(self.language, 'rw_pasted', n=len(values), extra=(', ' + _studio_label(self.language, 'rw_skipped', n=skipped)) if skipped else '')
+
     def _name_ok(self):
         if self.name_draft.strip():
             return True
@@ -45405,7 +46036,10 @@ class AIStudioScreen:
     def _step_field(self, name, direction, big):
         self._set_field(name, self._get_field(name) + direction * self.FIELDS[name][2] * (5 if big else 1))
 
-    def new_model(self):
+    def new_model(self, confirmed=False):
+        if not confirmed and self.unsaved_steps() > 0:
+            self._ask('confirm_discard', lambda: self.new_model(True), steps=f'{self.unsaved_steps():,}')
+            return
         name, number = 'My AI', 1
         while name in AI_REGISTRY:
             number += 1
@@ -45415,16 +46049,39 @@ class AIStudioScreen:
                                 activation=AI_ACTIVATIONS[self.activation_index], seed=random.randrange(10 ** 6)))
         self.message = ''
 
-    def rebuild(self):
+    def rebuild(self, confirmed=False):
+        rl = self.model.meta.get('rl') if isinstance(self.model.meta.get('rl'), dict) else {}
+        steps = int(rl.get('steps_trained', 0)) if isinstance(rl.get('steps_trained'), (int, float)) else 0
+        if not confirmed and (steps > 0 or self.model.meta.get('quality')):
+            self._ask('confirm_rebuild', lambda: self.rebuild(True), steps=f'{steps:,}')
+            return
         self.model = AIModel.new(self.model.name, inputs=self.model.inputs, hidden=STUDIO_HIDDEN[self.hidden_index],
                                  activation=AI_ACTIVATIONS[self.activation_index], seed=random.randrange(10 ** 6))
-        self.history, self.checkpoints, self.session_steps = [], [], 0          # a rebuilt AI starts from nothing, and so does its chart
+        self.history, self.checkpoints, self.session_steps, self.saved_steps = [], [], 0, 0      # a rebuilt AI starts from nothing, and so does its chart
+        self.model.meta['studio'] = self._setup_snapshot()
+        rl_state_delete(self.model.name)                                         # what the learning had saved belongs to the old weights
+        self.state_bytes = 0
+        self.message = _studio_label(self.language, 'rebuilt')
 
     def toggle_input(self, key):
         chosen = set(self.model.inputs)
         chosen.symmetric_difference_update({key})
         if chosen:
             self.model = ai_model_with_inputs(self.model, chosen)
+            rl_state_delete(self.model.name)                                    # other inputs: the saved learning state no longer fits
+            self.state_bytes = 0
+            if (self.model.meta.get('rl') or {}).get('steps_trained'):
+                self.message = _studio_label(self.language, 'inputs_changed')
+
+    def add_easy_inputs(self):
+        missing = [k for k in AI_EASY_INPUTS if k not in self.model.inputs]
+        if not missing:
+            self.message = _studio_label(self.language, 'inputs_easy_have')
+            return
+        self.model = ai_model_with_inputs(self.model, set(self.model.inputs) | set(missing))
+        rl_state_delete(self.model.name)
+        self.state_bytes = 0
+        self.message = _studio_label(self.language, 'inputs_easy_added')
 
     def adjust_weight(self, key, direction, big=False):
         value = self.reward.get(key, 0.0)
@@ -45468,6 +46125,7 @@ class AIStudioScreen:
         steps = STUDIO_STEPS[self.steps_index] if kind == 'steps' else None
         duration = seconds if kind == 'time' else None
         recovery = os.path.join(ai_library_dir(), 'recovery', _ai_file_name(model.name) + '.sgfai')
+        state_path = rl_state_path(model.name)
         explore_restart = self.explore_restart
 
         def work(job):
@@ -45482,7 +46140,7 @@ class AIStudioScreen:
             result = rl_train_dqn(model, reward, config, steps=steps, seed=random.randrange(10 ** 6), on_progress=progress,
                                   should_stop=lambda: job.stop, duration=duration, history=job.checkpoints,
                                   on_autosave=autosave if kind != 'steps' else None,
-                                  explore='restart' if explore_restart else 'continue')
+                                  explore='restart' if explore_restart else 'continue', state_path=state_path)
             if not result.get('autosave_error') and os.path.exists(recovery):
                 os.remove(recovery)                                           # it finished normally: the backup is not needed
             return result
@@ -45544,6 +46202,7 @@ class AIStudioScreen:
         self.message = _studio_label(self.language, 'exported', path=path)
 
     def poll(self):
+        self._setup_tick()
         job = self.job
         if job is None:
             return
@@ -45568,9 +46227,17 @@ class AIStudioScreen:
             if job.result:
                 self.session_steps = job.result.get('steps_done', job.steps_done)
             self.history, self.checkpoints = rl_clean_history(self.model.meta.get('rl')), []      # the saved history now includes this run
+            self.state_bytes = rl_state_size(self.model.name)
             last = job.checkpoints[-1] if job.checkpoints else {'avg_fruits': 0.0, 'avg_reward': 0.0}
             self.message = (_studio_label(lang, 'stopped') if job.stop else
                             _studio_label(lang, 'done_training', fruits=f"{last['avg_fruits']:.2f}", reward=f"{last['avg_reward']:.1f}"))
+            state_result = (job.result or {}).get('state') or {}
+            if state_result.get('loaded') == 'loaded':
+                self.message += '  ' + _studio_label(lang, 'state_restored')
+            elif str(state_result.get('loaded', '')).startswith('ignored'):
+                self.message += '  ' + _studio_label(lang, 'state_ignored', why=str(state_result['loaded'])[8:])
+            if state_result.get('error'):
+                self.message += '  ' + _studio_label(lang, 'state_failed', reason=state_result['error'])
             if job.result and job.result.get('autosave_error'):
                 self.message += '  ' + _studio_label(lang, 'autosave_failed', reason=job.result['autosave_error'])
             if self.speed_text():
@@ -45592,7 +46259,9 @@ class AIStudioScreen:
         if not self._name_ok():
             return
         self.model.name = self.name_draft = self.name_draft.strip()
+        self.model.meta['studio'] = self._setup_snapshot()
         ai_library_save(self.model)
+        self.saved_steps = int((self.model.meta.get('rl') or {}).get('steps_trained', 0)) if isinstance(self.model.meta.get('rl'), dict) else 0
         self.message = _studio_label(self.language, 'saved', name=self.model.name)
 
     def delete(self):
@@ -45600,13 +46269,17 @@ class AIStudioScreen:
             return
         name = self.model.name
         ai_library_delete(name)
+        rl_state_delete(name)
         names = sorted(AI_REGISTRY)
         self.message = _studio_label(self.language, 'deleted', name=name)
         self._adopt(AI_REGISTRY[names[0]] if names else AIModel.new('My AI', hidden=STUDIO_HIDDEN[self.hidden_index]))
 
-    def next_model(self):
+    def next_model(self, confirmed=False):
         names = sorted(AI_REGISTRY)
         if self.model.name in AI_REGISTRY and len(names) > 1:
+            if not confirmed and self.unsaved_steps() > 0:
+                self._ask('confirm_discard', lambda: self.next_model(True), steps=f'{self.unsaved_steps():,}')
+                return
             self.load(AI_REGISTRY[names[(names.index(self.model.name) + 1) % len(names)]])
 
     def _cycle(self, attr, count):
@@ -45629,9 +46302,21 @@ class AIStudioScreen:
         elif name == 'rename':
             self._start_edit('name', pos)
         elif name == 'preset':
-            presets = list(RL_REWARD_PRESETS)
-            self.preset_index = (self.preset_index + 1) % len(presets)
-            self.reward = rl_reward_spec(presets[self.preset_index])
+            names = rl_preset_names(self.user_presets)
+            current = self.matching_preset()
+            start = names.index(current) if current in names else self.preset_index % len(names)
+            self.preset_index = (start + 1) % len(names)
+            self.reward = rl_preset_values(names[self.preset_index], self.user_presets)
+        elif name == 'rw_copy':
+            self.copy_rewards()
+        elif name == 'rw_paste':
+            self.paste_rewards()
+        elif name == 'rw_save':
+            self._start_edit('preset_name')
+        elif name == 'rw_del':
+            self.delete_preset()
+        elif name == 'rw_name':
+            self._start_edit('preset_name')
         elif name == 'mode':
             self._cycle('mode_index', 4)
         elif name == 'learners':
@@ -45665,6 +46350,8 @@ class AIStudioScreen:
             self._cycle('hidden_index', len(STUDIO_HIDDEN))
         elif name == 'activation':
             self._cycle('activation_index', len(AI_ACTIVATIONS))
+        elif name == 'inputs_easy':
+            self.add_easy_inputs()
         elif name.startswith('in_'):
             self.toggle_input(name[3:])
         elif name.startswith('w-') or name.startswith('w+'):
@@ -45676,6 +46363,21 @@ class AIStudioScreen:
         return None
 
     def handle_event(self, event):
+        if self.confirm is not None:                                          # a question is open: only Yes, Cancel, Enter and Esc count
+            pending = self.confirm
+            if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_BACKSPACE):
+                self.confirm = None
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.confirm = None
+                pending['yes']()
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                clicked = next((name for name, rect in self.hits.items() if rect.collidepoint(event.pos)), None)
+                if clicked == 'confirm_yes':
+                    self.confirm = None
+                    pending['yes']()
+                elif clicked == 'confirm_no' or clicked is None:
+                    self.confirm = None if clicked == 'confirm_no' else self.confirm
+            return None
         if event.type == pygame.KEYDOWN:
             if self.editor is not None:
                 result = self.editor.key(event)
@@ -45828,6 +46530,8 @@ class AIStudioScreen:
                 else _studio_label(lang, 'trained', steps=f'{trained_total:,}')) + '   ' + _studio_label(lang, 'backend', name=_rl_backend())
         if self.job is not None and not self.job.done and self.job.label_key == 'training' and self.job.rate > 0:
             info += '   ' + _studio_label(lang, 'rate', sps=f'{self.job.rate:,.0f}')
+        if self.state_bytes > 0:
+            info += '   ' + _studio_label(lang, 'state_size', mb=f'{self.state_bytes / 1048576.0:.1f}')
         self._t(info, small, COLORS['light_gray'], chip.right + 10, top + 3, False, sw - chip.right - m - 120)
         self._button('back', pygame.Rect(sw - m - 100, m // 2, 100, row_h), _studio_label(lang, 'back'), COLORS['red'])
         # three columns
@@ -45837,9 +46541,25 @@ class AIStudioScreen:
         # -- rewards
         left = pygame.Rect(m, body_top, lw - m, bottom - body_top)
         self._t(_studio_label(lang, 'rewards'), small, COLORS['light_gray'], left.x, left.y, False, left.w)
-        self._button('preset', pygame.Rect(left.x, left.y + small + 4, left.w, row_h),
-                     f"{_studio_label(lang, 'preset')}: {list(RL_REWARD_PRESETS)[self.preset_index]}", COLORS['purple'])
-        list_top = left.y + small + row_h + 10
+        preset_rect = pygame.Rect(left.x, left.y + small + 4, left.w, row_h)
+        matching = self.matching_preset()
+        if self.edit_target == 'preset_name':                                    # typing the name to save the weights under
+            self.hits['rw_name'] = preset_rect
+            pygame.draw.rect(screen, (60, 70, 110), preset_rect, border_radius=6)
+            pygame.draw.rect(screen, COLORS['white'], preset_rect, 2, border_radius=6)
+            prompt = _studio_label(lang, 'preset_name_prompt') + ': '
+            prompt_font = get_font(lang, 'bold', max(11, min(16, row_h - 10)))
+            self._t(prompt, small, COLORS['light_gray'], preset_rect.x + 8, preset_rect.y + 3)
+            self.editor.draw(screen, pygame.Rect(preset_rect.x + 12 + prompt_font.size(prompt)[0], preset_rect.y, max(10, preset_rect.w - 20 - prompt_font.size(prompt)[0]), preset_rect.h),
+                             prompt_font, COLORS['white'])
+        else:
+            self._button('preset', preset_rect, f"{_studio_label(lang, 'preset')}: {matching or _studio_label(lang, 'preset_custom')}", COLORS['purple'])
+        tools_y, tools_h = preset_rect.bottom + 3, max(18, row_h - 4)
+        tool_w = (left.w - 3 * 4) // 4
+        for index, (tool, enabled) in enumerate((('rw_copy', True), ('rw_paste', True), ('rw_save', True), ('rw_del', matching in self.user_presets))):
+            self._button(tool, pygame.Rect(left.x + index * (tool_w + 4), tools_y, tool_w, tools_h), _studio_label(lang, tool),
+                         COLORS['button'] if enabled else COLORS['dark_gray'])
+        list_top = tools_y + tools_h + 8
         pt = lang.startswith('pt')
         previous_clip = screen.get_clip()
         screen.set_clip(pygame.Rect(left.x, list_top, left.w, left.bottom - list_top))
@@ -45885,8 +46605,11 @@ class AIStudioScreen:
             resume_eps = rl_resume_epsilon(rl_now, RL_DEFAULT_CONFIG, 'continue')
             rows.append(('button', 'explore', f"{_studio_label(lang, 'explore')}: " + (_studio_label(lang, 'explore_restart') if self.explore_restart
                          else _studio_label(lang, 'explore_continue', pct=int(round(resume_eps * 100))))))
-        rows += [('button', 'hidden', f"{_studio_label(lang, 'layers')}: {'x'.join(str(h) for h in STUDIO_HIDDEN[self.hidden_index])}"),
-                 ('button', 'activation', f"{_studio_label(lang, 'activation')}: {AI_ACTIVATIONS[self.activation_index]}")]
+        pending_layers = tuple(STUDIO_HIDDEN[self.hidden_index]) != tuple(self.model.hidden)
+        pending_activation = AI_ACTIVATIONS[self.activation_index] != self.model.activation
+        layers_text = 'x'.join(str(h) for h in STUDIO_HIDDEN[self.hidden_index])
+        rows += [('button', 'hidden', f"{_studio_label(lang, 'layers')}: " + (f"{'x'.join(str(h) for h in self.model.hidden)} > {layers_text}" if pending_layers else layers_text), pending_layers),
+                 ('button', 'activation', f"{_studio_label(lang, 'activation')}: " + (f"{self.model.activation} > {AI_ACTIVATIONS[self.activation_index]}" if pending_activation else AI_ACTIVATIONS[self.activation_index]), pending_activation)]
         # the rows share the column: with a short window they get thinner instead of running off the bottom
         unit = max(18, min(row_h + 4, int(mid.h // (len(rows) + 8.9))))
         rh = max(16, unit - 4)
@@ -45894,7 +46617,7 @@ class AIStudioScreen:
         for row in rows:
             rect = pygame.Rect(mid.x, y, mid.w, rh)
             if row[0] == 'button':
-                self._button(row[1], rect, row[2])
+                self._button(row[1], rect, row[2], (200, 110, 40) if len(row) > 3 and row[3] else None)
             elif row[0] == 'size':
                 half = (rect.w - 6) // 2
                 self._field('sz_w', pygame.Rect(rect.x, y, half, rh), 'W ')
@@ -45911,8 +46634,12 @@ class AIStudioScreen:
         self._button('train', pygame.Rect(mid.x, y, mid.w, rh + 6), _studio_label(lang, 'stop' if training else 'train'),
                      COLORS['red'] if training else (COLORS['dark_gray'] if check['status'] == 'blocked' else COLORS['green']))
         y += rh + 10
+        rl_note = self.model.meta.get('rl') if isinstance(self.model.meta.get('rl'), dict) else {}
+        trained_now = int(rl_note.get('steps_trained', 0)) if isinstance(rl_note.get('steps_trained'), (int, float)) else 0
         if check['status'] == 'blocked':
             note, note_color = self.validation_text(check['blocked'][0]), COLORS['red']
+        elif self.layout_pending():                                                # the layout will change on Rebuild: say what is lost
+            note, note_color = _studio_label(lang, 'layout_pending_trained' if trained_now else 'layout_pending', steps=f'{trained_now:,}'), (255, 170, 90)
         elif check['status'] == 'warn':
             note, note_color = self.validation_text(check['warnings'][0]), COLORS['orange']
             if len(check['warnings']) > 1:
@@ -45945,8 +46672,11 @@ class AIStudioScreen:
         # -- inputs and chart
         rx = mid.right + m
         right = pygame.Rect(rx, body_top, sw - rx - m, bottom - body_top)
-        self._t(_studio_label(lang, 'inputs'), small, COLORS['light_gray'], right.x, right.y, False, right.w)
-        y = right.y + small + 6
+        easy_w = min(104, right.w // 2)
+        self._t(_studio_label(lang, 'inputs'), small, COLORS['light_gray'], right.x, right.y, False, right.w - easy_w - 6)
+        self._button('inputs_easy', pygame.Rect(right.right - easy_w, right.y - 2, easy_w, small + 6), _studio_label(lang, 'inputs_easy'),
+                     COLORS['dark_gray'] if all(k in self.model.inputs for k in AI_EASY_INPUTS) else (60, 130, 90))
+        y = right.y + small + 6 + 4
         half = (right.w - 6) // 2
         chosen = set(self.model.inputs)
         for index, (key, label, size, _default) in enumerate(AI_INPUT_GROUPS):
@@ -45980,12 +46710,58 @@ class AIStudioScreen:
         else:
             text = self.message or _studio_label(lang, 'idle')
         self._t(text, small, COLORS['white'], bar.x + 8, bar.y + 3, False, bar.w - 16)
+        if self.confirm is not None:
+            self._draw_confirm(screen, sw, sh, small)
+
+    def finish_job_before_exit(self, timeout=15.0):
+        """Closing the game while it trains: ask the training to stop and give it a moment to save its state, so closing the
+        window never costs the work of the last minutes."""
+        job = self.job
+        if job is None or job.done:
+            return True
+        job.stop = True
+        deadline = time.monotonic() + timeout
+        while not job.done and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return job.done
+
+    def _draw_confirm(self, screen, sw, sh, small):
+        """A question with Yes and Cancel: everything else is dimmed and cannot be clicked until it is answered."""
+        dim = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 170))
+        screen.blit(dim, (0, 0))
+        self.hits = {}                                                            # nothing behind the question can be clicked
+        lang = self.language
+        width = min(sw - 40, 480)
+        font = get_font(lang, 'regular', max(13, small + 2))
+        lines, line = [], ''
+        for word in self.confirm['text'].split(' '):
+            if line and font.size(line + ' ' + word)[0] > width - 36:
+                lines.append(line)
+                line = word
+            else:
+                line = (line + ' ' + word).strip()
+        lines.append(line)
+        height = 36 + len(lines) * (font.get_height() + 4) + 14 + 40
+        panel = pygame.Rect(0, 0, width, height)
+        panel.center = (sw // 2, sh // 2)
+        pygame.draw.rect(screen, (26, 32, 54), panel, border_radius=10)
+        pygame.draw.rect(screen, (230, 170, 80), panel, 2, border_radius=10)
+        y = panel.y + 18
+        for text_line in lines:
+            surf = font.render(text_line, True, COLORS['white'])
+            screen.blit(surf, (panel.x + 18, y))
+            y += font.get_height() + 4
+        button_w = (width - 36 - 10) // 2
+        self._button('confirm_yes', pygame.Rect(panel.x + 18, panel.bottom - 50, button_w, 34), _studio_label(lang, 'confirm_yes'), (200, 110, 40))
+        self._button('confirm_no', pygame.Rect(panel.x + 18 + button_w + 10, panel.bottom - 50, button_w, 34), _studio_label(lang, 'confirm_no'), COLORS['button'])
 
     def run(self):
         clock = pygame.time.Clock()
         while True:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
+                    self.finish_job_before_exit()
                     pygame.quit()
                     sys.exit()
                 elif event.type == pygame.VIDEORESIZE:
@@ -64888,6 +65664,32 @@ def _run_ia5_integration_selftest():
     _ai_named = dict(zip(ai_input_names(AI_INPUT_KEYS), ai_extract_features(AI_INPUT_KEYS, _ai_world)))
     assert _ai_named['Wall N'] == 1 / 6 and _ai_named['Obstacle N'] == 1 / 3 and _ai_named['Other snake E'] == 1 / 3
     assert _ai_named['Ghost mode (cross own body)'] == 0.6 and _ai_named['Heading E'] == 1.0
+    # easier inputs: position, board size, danger in the next cell, the fruit relative to where the snake looks, free space behind each move
+    _easy_world = {'width': 10, 'height': 8, 'wall': True, 'body': [(5, 0), (4, 0), (3, 0)], 'others': [], 'obstacles': {(6, 1)}, 'portals': set(), 'fruit': (8, 4)}
+    _easy = dict(zip(ai_input_names(AI_INPUT_KEYS), ai_extract_features(AI_INPUT_KEYS, _easy_world)))
+    assert _easy['Position x'] == 5 / 9 and _easy['Position y'] == 0.0 and _easy['Board width'] == 0.1 and _easy['Board height'] == 0.08
+    assert (_easy['Danger left'], _easy['Danger ahead'], _easy['Danger right']) == (1.0, 0.0, 0.0)              # heading east at the top wall: left (north) is the wall
+    assert _easy['Fruit ahead'] == 3 / 10.0 and _easy['Fruit right'] == 4 / 10.0                                  # 3 cells ahead, 4 to the south, which is the right-hand side
+    assert _easy['Free space left'] == 0.0 and 0.0 < _easy['Free space ahead'] <= 1.0 and 0.0 < _easy['Free space right'] <= 1.0
+    _trap = {'width': 5, 'height': 5, 'wall': True, 'body': [(1, 1), (0, 1), (0, 0)], 'others': [[(2, 0), (2, 1), (2, 2), (1, 2), (0, 2)]], 'obstacles': set(), 'portals': set(), 'fruit': None}
+    _boxed = dict(zip(ai_input_names(('danger', 'free_space', 'fruit_rel')), ai_extract_features(('danger', 'free_space', 'fruit_rel'), _trap)))
+    assert _boxed['Danger ahead'] == 1.0 and _boxed['Danger right'] == 1.0 and _boxed['Danger left'] == 0.0 and _boxed['Free space ahead'] == 0.0
+    assert 0.0 < _boxed['Free space left'] < 0.2 and _boxed['Fruit ahead'] == 0.0 and _boxed['Fruit right'] == 0.0           # one cell of room is almost a dead end
+    _open = dict(_trap, others=[], width=30, height=30)
+    assert ai_extract_features(('free_space',), _open)[0] > 0.9                                                         # plenty of room: capped at 1
+    _wrap = dict(_easy_world, wall=False)
+    assert dict(zip(ai_input_names(('danger',)), ai_extract_features(('danger',), _wrap)))['Danger left'] == 0.0           # no deadly walls: it wraps round
+    assert AI_INPUT_KEYS[:19] == ('wall', 'body', 'obstacle', 'other', 'portal', 'fruit_xy', 'fruit_dist', 'fruit_value', 'heading', 'length', 'speed', 'deadly_walls',
+                                  'pu_ghost', 'pu_invincible', 'pu_shield', 'pu_speed', 'pu_slow', 'pu_double', 'mode')    # the old columns did not move
+    _old_style = AIModel.new('old style')
+    assert len(_old_style.input_names) == 43 and all(k not in _old_style.inputs for k in AI_EASY_INPUTS)                      # new AIs start as before
+    _grown = ai_model_with_inputs(_old_style, set(_old_style.inputs) | set(AI_EASY_INPUTS))
+    assert len(_grown.input_names) == 43 + 2 + 3 + 2 + 3 and [row[:1] for row in _grown.layers[0][0]][0] == [_old_style.layers[0][0][0][0]]   # what was learned stays
+    _ai_big = {'width': 100, 'height': 100, 'wall': True, 'body': [(50, 50), (49, 50), (48, 50)], 'others': [], 'obstacles': set(), 'portals': set(), 'fruit': (90, 10)}
+    _t_big = time.perf_counter()
+    for _ in range(200):
+        ai_extract_features(AI_INPUT_KEYS, _ai_big)
+    assert (time.perf_counter() - _t_big) / 200 < 0.01                                                                  # a 100x100 board stays cheap (under 10 ms per decision)
     _ai_old_registry = dict(AI_REGISTRY)
     _ai_manager_old, _ai_root = _user_data_manager, tempfile.mkdtemp(prefix='sgf_ai_selftest_')
     try:
@@ -65077,7 +65879,7 @@ def _run_ia5_integration_selftest():
         _shutil_mod.rmtree(_st_root, ignore_errors=True)
 
     # Reinforcement learning: modes, power-ups, reward terms, DQN (NumPy == plain Python), it learns, and the Studio screen.
-    assert len(RL_REWARD_TERMS) >= 38 and len(RL_REWARD_PRESETS) >= 6 and len(ai_input_names(AI_INPUT_KEYS)) == 60
+    assert len(RL_REWARD_TERMS) >= 38 and len(RL_REWARD_PRESETS) >= 6 and len(ai_input_names(AI_INPUT_KEYS)) == 72
     _rl_mode_vec = dict(zip(ai_input_names(['mode']), ai_extract_features(['mode'], {'width': 10, 'height': 8, 'wall': True,
                     'body': [(5, 5), (4, 5)], 'fruit': (8, 5), 'mode': 'coop'})))
     assert _rl_mode_vec == {'Mode solo': 0.0, 'Mode versus': 0.0, 'Mode co-op': 1.0}                 # the AI knows which mode it plays
@@ -65262,6 +66064,226 @@ def _run_ia5_integration_selftest():
         finally:
             globals()['lower_current_thread_priority'] = _orig_lower
         assert (_st.window_active() in (True, False))
+        # the set-up is remembered (per AI and as the last used one); the layer buttons start at what the AI has; a change of layers
+        # asks first when it would throw training away; unsaved training is not lost silently
+        _st.confirm = None
+        _setup_before = _st._setup_snapshot()
+        _st.mode_index, _st.learners, _st.bots_index, _st.board_w, _st.board_h, _st.powerups = 2, 3, 2, 17, 12, False
+        _st.duration_kind, _st.duration_hms, _st.steps_index = 'time', [1, 2, 3], 3
+        _st._setup_tick()
+        assert _st.model.meta['studio']['mode'] == 2 and _st.model.meta['studio']['board'] == [17, 12] and os.path.exists(_st._setup_path())
+        _st2 = AIStudioScreen(Settings(), pygame.Surface((800, 600)))                              # a new Studio starts with the last set-up
+        assert (_st2.mode_index, _st2.learners, _st2.bots_index, _st2.board_w, _st2.board_h, _st2.powerups, _st2.duration_kind, _st2.duration_hms, _st2.steps_index) == \
+            (_st.mode_index, 3, 2, 17, 12, False, 'time', [1, 2, 3], 3)
+        assert rl_clean_setup({'mode': 9, 'learners': 'x', 'board': [2, 500], 'hms': [0, 0, 1], 'duration': 'forever', 'powerups': 1, 'steps': True}) == {}
+        assert rl_clean_setup(None) == {} and rl_clean_setup({'mode': 1, 'board': [5, 6], 'hms': [0, 5, 0], 'chart_mode': 'fruits'}) == {'mode': 1, 'board': [5, 6], 'hms': [0, 5, 0], 'chart_mode': 'fruits'}
+        _own = AIModel.new('Own setup', hidden=(64, 32))
+        _own.meta['studio'] = {'mode': 3, 'learners': 4, 'board': [30, 20]}
+        _st2._adopt(_own)                                                                          # an AI with its own saved set-up brings it
+        assert (_st2.mode_index, _st2.learners, _st2.board_w) == (3, 4, 30) and STUDIO_HIDDEN[_st2.hidden_index] == (64, 32)
+        _st2.draw()
+        assert not _st2.layout_pending()
+        _st2.hidden_index = STUDIO_HIDDEN.index((24,))                                             # ask for other layers than the AI has
+        _st2.draw()
+        assert _st2.layout_pending()
+        _st2.model.meta['rl'] = {'steps_trained': 640000}
+        _st2.saved_steps = 640000
+        _st2.draw()
+        assert _st2.model.hidden == [64, 32]                                                       # nothing happens until Rebuild
+        _st2.hits.clear()
+        _st2.draw()
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st2.hits['rebuild'].center))
+        assert _st2.confirm is not None and '640,000' in _st2.confirm['text'] and _st2.model.hidden == [64, 32]    # it asks first, and says how much is lost
+        _st2.draw()
+        assert set(_st2.hits) == {'confirm_yes', 'confirm_no'}                                     # nothing behind the question can be clicked
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=(3, 3)))
+        assert _st2.confirm is not None                                                            # a click elsewhere does not answer it
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st2.hits['confirm_no'].center))
+        assert _st2.confirm is None and _st2.model.hidden == [64, 32] and _st2.model.meta['rl']['steps_trained'] == 640000
+        _st2.draw()
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st2.hits['rebuild'].center))
+        _st2.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE, unicode='', mod=0))
+        assert _st2.confirm is None and _st2.model.hidden == [64, 32]                              # Esc cancels too
+        _st2.draw()
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st2.hits['rebuild'].center))
+        _st2.draw()
+        _st2.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st2.hits['confirm_yes'].center))
+        assert _st2.confirm is None and _st2.model.hidden == [24] and not _st2.model.meta.get('rl') and _st2.history == [] and not _st2.layout_pending()
+        _st2.model.meta['rl'] = {'steps_trained': 5000}                                            # unsaved training is protected on New AI and Next AI
+        _st2.saved_steps = 0
+        _st2.new_model()
+        assert _st2.confirm is not None and '5,000' in _st2.confirm['text']
+        _st2.confirm = None
+        _st2.saved_steps = 5000
+        _name_before_new = _st2.model.name
+        _st2.new_model()
+        assert _st2.confirm is None and _st2.model.name != _name_before_new                       # nothing unsaved: no question
+        _st._setup_apply(rl_clean_setup(_setup_before))                                            # leave the Studio under test as it was
+        _st._setup_tick()
+        # the training state cache: what the learning needs besides the weights is kept, so stopping and starting again carries on
+        _tensors = [[[0.25, -0.5], [1.5, 2.0]], [0.125, 0.5], [[0.0, 0.25]]]
+        _mem = [([0.5, 0.25, -1.0], 1, 0.75, [0.5, 0.0, -1.0], 0.0), ([0.0, 1.0, 0.5], 2, -2.0, [0.25, 1.0, 0.5], 1.0)]
+        _packed = rl_state_pack({'t': 7}, _tensors, _mem)
+        _head, _back, _mem_back = rl_state_unpack(_packed)
+        assert _back == _tensors and _mem_back == _mem and _head['t'] == 7 and _head['n'] == 2 and _head['dim'] == 3
+        assert rl_state_unpack(rl_state_pack({}, _tensors, []))[2] == []
+        _bad_cases = [b'', b'nothing', _packed[:12], _packed[:-5], b'SGFSTATE1' + struct.pack('<I', 10 ** 9) + b'{}', _packed[:9] + b'\xff\xff\xff\xff' + _packed[13:],
+                      b'SGFSTATE1' + struct.pack('<I', 2) + b'{}' + _zlib_mod.compress(b'x')]
+        _huge = json.dumps({'n': 10 ** 9, 'dim': 10 ** 6, 'params': 1, 'shapes': [[1]]}).encode()
+        _bad_cases.append(b'SGFSTATE1' + struct.pack('<I', len(_huge)) + _huge + _zlib_mod.compress(b'0' * 100))
+        _bomb_head = json.dumps({'n': 0, 'dim': 0, 'params': 1, 'shapes': [[1]]}).encode()
+        _bad_cases.append(b'SGFSTATE1' + struct.pack('<I', len(_bomb_head)) + _bomb_head + _zlib_mod.compress(b'\0' * 50_000_000))      # compresses to a few KB, expands to 50 MB
+        _rng_fuzz = random.Random(5)
+        for _ in range(60):
+            _damaged = bytearray(_packed)
+            for _k in range(_rng_fuzz.randrange(1, 6)):
+                _damaged[_rng_fuzz.randrange(len(_damaged))] = _rng_fuzz.randrange(256)
+            _bad_cases.append(bytes(_damaged))
+        for _bad in _bad_cases:
+            try:
+                rl_state_unpack(_bad)
+            except (ValueError, _zlib_mod.error, struct.error, UnicodeDecodeError):
+                pass
+            except Exception as _exc_bad:
+                raise AssertionError(f'a damaged training state raised {type(_exc_bad).__name__}')
+        _sdir = tempfile.mkdtemp()
+        _spath = os.path.join(_sdir, 'cache.sgfstate')
+        _cfg_cache = {'mode': 'solo', 'learners': 1, 'bots': [], 'width': 8, 'height': 6, 'powerups': False, 'max_steps': 300}
+        _m_cache = AIModel.new('cache test', hidden=(8,), seed=3)
+        _r_cache = rl_reward_spec()
+        _o1 = rl_train_dqn(_m_cache, _r_cache, _cfg_cache, steps=3000, seed=1, state_path=_spath)
+        assert _o1['state']['loaded'] == 'none' and _o1['state']['saved'] and os.path.getsize(_spath) > 0                   # a new AI has nothing to load
+        _t1 = rl_state_unpack(open(_spath, 'rb').read())[0]['t']
+        _o2 = rl_train_dqn(_m_cache, _r_cache, _cfg_cache, steps=1500, seed=2, state_path=_spath)
+        assert _o2['state']['loaded'] == 'loaded' and _o2['state']['buffer_kept'] and rl_state_unpack(open(_spath, 'rb').read())[0]['t'] > _t1   # carried on
+        assert _m_cache.meta['rl']['steps_trained'] == 4500
+        _m_other = AIModel.from_dict(json.loads(json.dumps(_m_cache.to_dict())))                                             # another reward: the old buffer is dropped
+        _o3 = rl_train_dqn(_m_other, dict(_r_cache, fruit=_r_cache['fruit'] + 1.0), _cfg_cache, steps=600, seed=3, state_path=_spath)
+        assert _o3['state']['loaded'] == 'loaded' and not _o3['state']['buffer_kept']
+        _m_edit = AIModel.from_dict(json.loads(json.dumps(_m_cache.to_dict())))
+        rl_train_dqn(_m_cache, _r_cache, _cfg_cache, steps=500, seed=4, state_path=_spath)                                  # the state now belongs to _m_cache's weights
+        _m_edit.layers[0][0][0][0] += 0.25                                                                                   # other weights: not used
+        _o4 = rl_train_dqn(_m_edit, _r_cache, _cfg_cache, steps=500, seed=5, state_path=_spath)
+        assert _o4['state']['loaded'].startswith('ignored:') and 'weights' in _o4['state']['loaded'] and _m_edit.meta['rl']['steps_trained'] == 4500 + 500
+        _m_layout = AIModel.new('cache test', hidden=(12,), seed=3)
+        _m_layout.meta['rl'] = {'steps_trained': 1000}
+        assert rl_train_dqn(_m_layout, _r_cache, _cfg_cache, steps=300, seed=6, state_path=_spath)['state']['loaded'] == 'ignored:other layout'
+        with open(_spath, 'wb') as _handle:
+            _handle.write(b'garbage')
+        _m_cache.meta['rl']['steps_trained'] = 1000
+        assert rl_train_dqn(_m_cache, _r_cache, _cfg_cache, steps=300, seed=7, state_path=_spath)['state']['loaded'].startswith('ignored:damaged')   # it trains anyway
+        assert rl_train_dqn(AIModel.new('x', hidden=(8,)), _r_cache, _cfg_cache, steps=100, seed=8, state_path=os.path.join(_sdir, 'no', 'such.sgfstate'))['state']['saved']
+        # the same, through the Studio: the file appears, shows its size, is removed on Rebuild, and closing the game while training stops it first
+        _st3 = AIStudioScreen(Settings(), pygame.Surface((800, 600)))
+        _st3._adopt(AIModel.new('Cache studio', hidden=(24,)))
+        _st3.duration_kind, _st3.steps_index = 'steps', 0
+        _st3.board_w, _st3.board_h = 8, 6
+        _st3.train()
+        _st_started = time.monotonic()
+        while _st3.job is not None and time.monotonic() - _st_started < 120:
+            _st3.poll()
+            time.sleep(0.02)
+        assert rl_state_size('Cache studio') > 0 and _st3.state_bytes > 0
+        _st3.draw()
+        _st3.train()
+        while _st3.job is not None and time.monotonic() - _st_started < 240:
+            _st3.poll()
+            time.sleep(0.02)
+        assert 'restored' in _st3.message.lower()
+        _st3.duration_kind = 'continuous'
+        _st3.train()
+        time.sleep(0.5)
+        assert _st3.finish_job_before_exit(20) and _st3.job.done and rl_state_size('Cache studio') > 0
+        _st3.poll()
+        _st3.rebuild()
+        _st3.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, unicode='\r', mod=0))
+        assert rl_state_size('Cache studio') == 0 and _st3.state_bytes == 0
+        rl_state_delete('Cache studio')
+        _shutil_mod.rmtree(_sdir, ignore_errors=True)
+        # reward presets, copy and paste
+        _reward_text = rl_rewards_to_text(rl_reward_spec('hunter'))
+        _vals, _skipped, _problem = rl_rewards_from_text(_reward_text)
+        assert _problem == '' and _skipped == 0 and dict(rl_default_reward(), **_vals) == rl_reward_spec('hunter')              # what is copied pastes back exactly
+        assert rl_rewards_from_text('{"fruit": 12.5, "nope": 3, "death": "x", "loop": NaN}') == ({'fruit': 12.5}, 3, '')       # unknown, non-numeric and non-finite entries are left out
+        assert rl_rewards_from_text('{"rewards": {"fruit": 1e999}}')[2] == 'rw_paste_invalid' and rl_rewards_from_text('{"fruit": 1e12}')[2] == 'rw_paste_invalid'
+        for _junk in ('', '   ', 'abc', '[1, 2]', '{"rewards": 5}', '{}', '{"x": 1}', 'null', '"text"', '[' * 5000, '{"fruit": true}', None, 5, '{' + '"a":1,' * 50000 + '"b":2}'):
+            assert rl_rewards_from_text(_junk)[2] == 'rw_paste_invalid', _junk
+        _files = tempfile.mkdtemp()
+        _presets_file = _rl_presets_path()
+        os.makedirs(os.path.dirname(_presets_file), exist_ok=True)
+        for _garbage in (b'', b'not json', b'[1,2,3]', b'{"presets": 5}', b'{"presets": {"ok": {"fruit": 5}, "bad": {"fruit": "x"}, "": {"fruit": 1}, "balanced": {"fruit": 1}, "nan": {"fruit": NaN}}}'):
+            with open(_presets_file, 'wb') as _handle:
+                _handle.write(_garbage)
+            _loaded = rl_user_presets_load()
+            assert _loaded in ({}, {'ok': {'fruit': 5.0}}), (_garbage, _loaded)
+        os.remove(_presets_file)
+        _st4 = AIStudioScreen(Settings(), pygame.Surface((800, 600)))
+        _st4._adopt(AIModel.new('Preset studio', hidden=(24,)))
+        _st4.draw()
+        assert _st4.matching_preset() == 'balanced' and set(rl_preset_names({})) == set(RL_REWARD_PRESETS)
+        _st4.reward['fruit'] = 77.0                                                                                           # editing a value: the preset is "custom"
+        assert _st4.matching_preset() is None
+        _st4.draw()
+        _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_save'].center))                # save the set as a preset
+        assert _st4.edit_target == 'preset_name'
+        _st4.draw()
+        for _ch in 'My style':
+            _st4.handle_event(pygame.event.Event(pygame.KEYDOWN, key=ord('a'), unicode=_ch, mod=0))
+        _st4.handle_event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, unicode='\r', mod=0))
+        assert 'My style' in _st4.user_presets and _st4.user_presets['My style']['fruit'] == 77.0 and _st4.matching_preset() == 'My style' and os.path.exists(_presets_file)
+        assert rl_user_presets_load() == {'My style': _st4.user_presets['My style']}
+        _st4.draw()
+        _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['preset'].center))                # cycling goes through built-in presets, then mine
+        assert _st4.matching_preset() == 'balanced'                                                                           # after mine comes the first built-in one
+        for _ in range(len(RL_REWARD_PRESETS)):
+            _st4.draw()
+            _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['preset'].center))
+        assert _st4.matching_preset() == 'My style' and _st4.reward['fruit'] == 77.0
+        _st4.reward['death'] = -1.5
+        _st4.draw()
+        _st4._start_edit('preset_name')                                                                                        # a built-in name, an empty name and the limit are refused
+        _st4.editor.text = 'hunter'
+        _st4._commit_edit()
+        assert 'hunter' not in _st4.user_presets and '"hunter"' in _st4.message
+        _st4._start_edit('preset_name')
+        _st4.editor.text = '   '
+        _st4._commit_edit()
+        assert _st4.message == _studio_label('en', 'preset_name_empty')
+        _st4._start_edit('preset_name')
+        _st4.editor.text = 'My style'                                                                                         # the same name again: replaces it
+        _st4._commit_edit()
+        assert _st4.user_presets['My style']['death'] == -1.5
+        _st4.draw()
+        _clip = {}
+        _orig_copy, _orig_read = _copy_to_clipboard, _read_from_clipboard
+        globals()['_copy_to_clipboard'] = lambda text: _clip.update(text=text) or True
+        globals()['_read_from_clipboard'] = lambda: _clip.get('text', '')
+        try:
+            _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_copy'].center))
+            assert json.loads(_clip['text'])['rewards']['death'] == -1.5 and 'copied' in _st4.message
+            _st4.reward = rl_reward_spec('explorer')
+            _st4.draw()
+            _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_paste'].center))
+            assert _st4.reward['death'] == -1.5 and _st4.reward['fruit'] == 77.0 and 'pasted' in _st4.message and _st4.matching_preset() == 'My style'
+            _clip['text'] = 'hello'
+            before = dict(_st4.reward)
+            _st4.draw()
+            _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_paste'].center))
+            assert _st4.reward == before and _st4.message == _studio_label('en', 'rw_paste_invalid')                         # nothing valid: nothing changes
+            globals()['_copy_to_clipboard'] = lambda text: False
+            _st4.draw()
+            _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_copy'].center))
+            assert os.path.exists(os.path.join(studio_data_dir(), 'rewards_copy.txt'))                                         # no clipboard: it goes to a file
+        finally:
+            globals()['_copy_to_clipboard'], globals()['_read_from_clipboard'] = _orig_copy, _orig_read
+        _st4.draw()
+        _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['rw_del'].center))                 # delete asks first
+        assert _st4.confirm is not None and 'My style' in _st4.confirm['text'] and 'My style' in _st4.user_presets
+        _st4.draw()
+        _st4.handle_event(pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=_st4.hits['confirm_yes'].center))
+        assert 'My style' not in _st4.user_presets and rl_user_presets_load() == {}
+        _st4.draw()
+        _shutil_mod.rmtree(_files, ignore_errors=True)
         # the chart: round-number axes, a window that zooms and moves, values under the pointer, and the update rate
         assert nice_ticks(0, 10, 4) == ([0, 2.5, 5, 7.5, 10], 2.5) and nice_ticks(-3.2, 11.8, 4)[0][0] >= -3.2 and len(nice_ticks(5, 5)[0]) >= 2
         assert len(nice_ticks(float('nan'), 1)[0]) == 2 and nice_ticks(0, 0.0003, 3)[1] <= 0.0001 and nice_ticks(0, 7_000_000, 4)[1] == 2_000_000
@@ -65568,7 +66590,7 @@ def _run_ia5_integration_selftest():
         while _st.job is not None and time.monotonic() - _st_started < 30:
             _st.poll()
             time.sleep(0.05)
-        assert _st.job is None and _st.message == _studio_label('en', 'stopped')
+        assert _st.job is None and _st.message.startswith(_studio_label('en', 'stopped'))
         _st.duration_kind, _st.board_w, _st.board_h, _st.mode_index = 'steps', 14, 10, 0
         for _st_size_ in ((800, 600), (640, 480)):                                 # the column still fits in small windows
             for _st_kind_ in ('steps', 'time', 'continuous'):
